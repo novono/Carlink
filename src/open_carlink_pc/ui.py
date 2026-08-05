@@ -19,7 +19,7 @@ class MainWindow:
     SOURCE_WIDTH = 1280
     SOURCE_HEIGHT = 720
     USB_MODE = "USB 有线"
-    WIRELESS_MODE = "无线实验"
+    WIRELESS_MODE = "无线互联"
 
     BG = "#0c0f0e"
     SURFACE = "#141816"
@@ -36,7 +36,7 @@ class MainWindow:
 
     def __init__(self, auto_connect: bool = False) -> None:
         self.root = tk.Tk()
-        self.root.title(f"OpenCarLink PC v{__version__} — OPPO ICCOA 有线互联")
+        self.root.title(f"OpenCarLink PC v{__version__} — OPPO ICCOA 互联")
         self.root.geometry("1320x820")
         self.root.minsize(960, 600)
         self.root.configure(background=self.BG)
@@ -51,7 +51,7 @@ class MainWindow:
             self._queue_video_frame,
         )
         self.usb_controller = CarLinkController(*controller_args)
-        self.wireless_controller = WirelessCarLinkController(*controller_args)
+        self.wireless_controller = WirelessCarLinkController(*controller_args, network_mode="wfd")
         self.controller: CarLinkController | WirelessCarLinkController = self.usb_controller
 
         self.connection_mode = tk.StringVar(value=self.USB_MODE)
@@ -133,7 +133,7 @@ class MainWindow:
         mode_group.grid(row=0, column=2, rowspan=2, padx=(28, 10))
         self.mode_buttons: list[tk.Radiobutton] = []
         for column, (label, value) in enumerate(
-            (("USB 有线", self.USB_MODE), ("无线实验", self.WIRELESS_MODE))
+            (("USB 有线", self.USB_MODE), ("无线互联", self.WIRELESS_MODE))
         ):
             button = tk.Radiobutton(
                 mode_group,
@@ -582,11 +582,12 @@ class MainWindow:
         self._clear_video()
         if self.connection_mode.get() == self.WIRELESS_MODE:
             self.controller = self.wireless_controller
-            self.connect_button.configure(text="启动无线")
-            self._set_state("无线实验服务未启动")
+            self.connect_button.configure(text="启动无线互联")
+            self._set_state("无线互联未启动")
             title = "等待无线 CarLink"
-            body = "当前 ColorOS P2P 组网仍处于实验阶段\n建议优先使用已经验证的 USB 有线模式"
+            body = "通过 BLE 发现车机，再建立 Wi-Fi Direct 实际链路\n请在手机 Car+ 中搜索并选择 PC CarLink"
             icon = "WLAN"
+            progress_labels = ("广播", "组网", "认证", "画面")
         else:
             self.controller = self.usb_controller
             self.connect_button.configure(text="连接手机")
@@ -594,6 +595,9 @@ class MainWindow:
             title = "连接 OPPO 手机"
             body = "解锁手机并将 USB 用途设为“文件传输”\n点击上方“连接手机”开始真实 CarLink 会话"
             icon = "USB"
+            progress_labels = ("USB", "AOA", "认证", "画面")
+        for (_node, label), text in zip(self.step_nodes, progress_labels, strict=True):
+            label.configure(text=text)
         self.video_canvas.itemconfigure(self._placeholder_icon, text=icon)
         self.video_canvas.itemconfigure(self._placeholder_title, text=title)
         self.video_canvas.itemconfigure(self._placeholder_body, text=body)
@@ -666,7 +670,7 @@ class MainWindow:
             color = self.GREEN
             detail = "1280 × 720 · 30 FPS · UIBC"
             progress = 4
-        elif "失败" in value:
+        elif "失败" in value or "超时" in value:
             color = self.RED
             detail = "打开诊断查看失败层级"
             progress = self._last_progress_index
@@ -680,7 +684,7 @@ class MainWindow:
             progress = -1
         elif "停止" in value or "断开" in value or "未启动" in value:
             color = self.TEXT_DIM
-            detail = "USB · OPPO ICCOA" if self.controller is self.usb_controller else "BLE · P2P 实验"
+            detail = "USB · OPPO ICCOA" if self.controller is self.usb_controller else "BLE · Wi-Fi Direct"
             progress = -1
         elif "扫描" in value:
             color = self.AMBER
@@ -694,6 +698,14 @@ class MainWindow:
             color = self.AMBER
             detail = "正在协商 AUTH / CONTROL / RTSP"
             progress = 2
+        elif "手机已发现" in value or "加入 Wi-Fi Direct" in value:
+            color = self.AMBER
+            detail = "正在建立 Wi-Fi Direct P2P 网络"
+            progress = 1
+        elif "Wi-Fi Direct" in value or "蓝牙广播" in value or "等待 OPPO" in value:
+            color = self.AMBER
+            detail = "BLE 发现 · Wi-Fi Direct 车机端"
+            progress = 0
         else:
             color = self.AMBER
             detail = "正在建立 CarLink 会话"
@@ -739,7 +751,7 @@ class MainWindow:
         self.stop_button.configure(state="normal")
         self._set_mode_buttons_enabled(False)
         if self.controller is self.wireless_controller:
-            self._append_log("正在启动无线实验模式；当前 ColorOS P2P 可能在组网阶段失败。")
+            self._append_log("正在启动真实无线互联：BLE 发现 → Wi-Fi Direct → ICCOA TCP。")
         else:
             self._append_log("正在扫描 USB 手机；请保持手机解锁并选择文件传输。")
         self.controller.start(full_payload=self.full_payload.get())
@@ -749,7 +761,10 @@ class MainWindow:
             return
         self._clear_video()
         self._set_state("正在停止…")
-        self._append_log("正在结束当前会话、释放 WinUSB 并重置手机 USB 端口…")
+        if self.controller is self.wireless_controller:
+            self._append_log("正在结束无线会话并释放 BLE、Wi-Fi Direct 和 TCP 资源…")
+        else:
+            self._append_log("正在结束当前会话、释放 WinUSB 并重置手机 USB 端口…")
         self.controller.stop()
         self.connect_button.configure(state="disabled")
         self.stop_button.configure(state="disabled")

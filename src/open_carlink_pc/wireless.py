@@ -26,8 +26,10 @@ from winrt.windows.devices.bluetooth.genericattributeprofile import (
 )
 from winrt.windows.devices.radios import Radio, RadioAccessStatus, RadioState
 from winrt.windows.devices.wifidirect import (
+    WiFiDirectAdvertisementListenStateDiscoverability,
     WiFiDirectAdvertisementPublisher,
     WiFiDirectAdvertisementPublisherStatus,
+    WiFiDirectConfigurationMethod,
     WiFiDirectConnectionListener,
     WiFiDirectDevice,
 )
@@ -90,6 +92,54 @@ def _wifi_channel_to_frequency(channel: int) -> int:
     if channel >= 1:
         return 5950 + channel * 5
     return 0
+
+
+def _wifi_direct_ssid() -> str:
+    return f"DIRECT-{secrets.token_hex(1).upper()}-OpenCarLink"
+
+
+def _network_interface_details() -> list[tuple[str, str, str]]:
+    interfaces: list[tuple[str, str, str]] = []
+    for interface_name, addresses in psutil.net_if_addrs().items():
+        ipv4 = next(
+            (
+                item.address
+                for item in addresses
+                if item.family == socket.AF_INET and item.address != "127.0.0.1"
+            ),
+            "",
+        )
+        mac_address = next(
+            (
+                item.address.replace("-", ":").lower()
+                for item in addresses
+                if item.family == psutil.AF_LINK and item.address
+            ),
+            "",
+        )
+        interfaces.append((interface_name, ipv4, mac_address))
+    return interfaces
+
+
+def _new_group_owner_interface(
+    previous_addresses: dict[str, str],
+) -> tuple[str, str, str] | None:
+    candidates = [
+        details
+        for details in _network_interface_details()
+        if details[1] and previous_addresses.get(details[0]) != details[1]
+    ]
+    preferred = next((details for details in candidates if details[1] == "192.168.137.1"), None)
+    if preferred is not None:
+        return preferred
+    return next(
+        (
+            details
+            for details in candidates
+            if details[1].startswith(("192.168.", "172.16.", "172.17."))
+        ),
+        None,
+    )
 
 
 def _interface_guid(interface_name: str) -> UUID | None:
@@ -262,23 +312,7 @@ class WindowsMobileHotspot:
         fallback_address = "192.168.137.1"
         fallback_mac = "02:00:00:00:00:00"
         candidates: list[tuple[str, str, str]] = []
-        for interface_name, addresses in psutil.net_if_addrs().items():
-            ipv4 = next(
-                (
-                    item.address
-                    for item in addresses
-                    if item.family == socket.AF_INET and item.address != "127.0.0.1"
-                ),
-                "",
-            )
-            mac = next(
-                (
-                    item.address.replace("-", ":").lower()
-                    for item in addresses
-                    if item.family == psutil.AF_LINK and item.address
-                ),
-                "",
-            )
+        for interface_name, ipv4, mac in _network_interface_details():
             if ipv4:
                 candidates.append((interface_name, ipv4, mac))
         preferred = next((item for item in candidates if item[1] == fallback_address), None)
@@ -440,6 +474,11 @@ class WindowsWiFiDirectGroupOwner:
     async def start(self) -> HotspotInfo:
         await self._enable_wifi_radio()
 
+        previous_addresses = {
+            interface_name: ipv4
+            for interface_name, ipv4, _mac_address in _network_interface_details()
+        }
+
         self._loop = asyncio.get_running_loop()
         listener = WiFiDirectConnectionListener()
         self._listener = listener
@@ -448,9 +487,15 @@ class WindowsWiFiDirectGroupOwner:
         publisher = WiFiDirectAdvertisementPublisher()
         advertisement = publisher.advertisement
         advertisement.is_autonomous_group_owner_enabled = True
+        advertisement.listen_state_discoverability = (
+            WiFiDirectAdvertisementListenStateDiscoverability.INTENSIVE
+        )
+        advertisement.supported_configuration_methods.append(
+            WiFiDirectConfigurationMethod.PUSH_BUTTON
+        )
         legacy = advertisement.legacy_settings
         legacy.is_enabled = True
-        legacy.ssid = "XHCODING 1868"
+        legacy.ssid = _wifi_direct_ssid()
         legacy.passphrase.password = "cl" + secrets.token_hex(6)
 
         self._publisher = publisher
@@ -475,19 +520,25 @@ class WindowsWiFiDirectGroupOwner:
             await self.stop()
             raise WirelessError("Windows Wi-Fi Direct GO 启动超时")
 
+        self.log("Wi-Fi Direct GO 已进入密集可发现状态，配置方式 WPS PBC")
+
         for _ in range(60):
-            interface_name, address, mac_address = WindowsMobileHotspot._interface_details()
-            if address == "192.168.137.1" and mac_address != "02:00:00:00:00:00":
+            interface = _new_group_owner_interface(previous_addresses)
+            if interface is not None:
+                interface_name, address, mac_address = interface
                 frequency = _wlan_interface_frequency(interface_name) or 2412
                 channel = 14 if frequency == 2484 else (frequency - 2407) // 5
                 if frequency >= 5000:
                     channel = (frequency - 5000) // 5
-                self.log(f"Wi-Fi Direct GO 使用信道 {channel}（{frequency} MHz）")
+                self.log(
+                    f"Wi-Fi Direct GO 接口 {interface_name}：{address}，"
+                    f"信道 {channel}（{frequency} MHz）"
+                )
                 return HotspotInfo(
                     ssid=legacy.ssid,
                     passphrase=legacy.passphrase.password,
                     address=address,
-                    mac_address=mac_address,
+                    mac_address=mac_address or "02:00:00:00:00:00",
                     frequency=frequency,
                     connection_type=WIRELESS_TYPE_WIFI_DIRECT,
                 )

@@ -1,12 +1,15 @@
 import json
 import unittest
+from unittest.mock import patch
 
 from open_carlink_pc.config import CarIdentity
 from open_carlink_pc.wireless import (
     HotspotInfo,
     WIRELESS_TYPE_BOTH,
     WIRELESS_TYPE_SOFT_AP,
+    _new_group_owner_interface,
     _wifi_channel_to_frequency,
+    _wifi_direct_ssid,
     build_car_name_service_data,
     build_primary_service_data,
     build_server_info,
@@ -20,6 +23,23 @@ class WirelessProtocolTests(unittest.TestCase):
         self.assertEqual(_wifi_channel_to_frequency(1), 2412)
         self.assertEqual(_wifi_channel_to_frequency(11), 2462)
         self.assertEqual(_wifi_channel_to_frequency(36), 5180)
+
+    def test_wifi_direct_ssid_uses_standard_prefix(self) -> None:
+        ssid = _wifi_direct_ssid()
+        self.assertTrue(ssid.startswith("DIRECT-"))
+        self.assertTrue(ssid.endswith("-OpenCarLink"))
+        self.assertLessEqual(len(ssid.encode("utf-8")), 32)
+
+    @patch("open_carlink_pc.wireless._network_interface_details")
+    def test_group_owner_interface_is_newly_addressed_interface(self, interfaces) -> None:
+        interfaces.return_value = [
+            ("Ethernet", "10.11.0.42", "74:86:e2:18:e0:e6"),
+            ("Local Area Connection* 11", "192.168.137.1", "4a:d5:7a:ce:c5:bf"),
+        ]
+        self.assertEqual(
+            _new_group_owner_interface({"Ethernet": "10.11.0.42"}),
+            ("Local Area Connection* 11", "192.168.137.1", "4a:d5:7a:ce:c5:bf"),
+        )
 
     def test_primary_service_data_matches_coloros_layout(self) -> None:
         identity = CarIdentity(

@@ -49,7 +49,7 @@ class WirelessCarLinkController:
         log: Callable[[str], None],
         state: Callable[[str], None],
         video: Callable[[Image.Image], None] | None = None,
-        network_mode: NetworkMode = "softap",
+        network_mode: NetworkMode = "wfd",
     ) -> None:
         if network_mode not in NETWORK_MODES:
             raise ValueError(f"不支持的无线网络模式：{network_mode}")
@@ -70,6 +70,8 @@ class WirelessCarLinkController:
         self._auth_session: AuthSession | None = None
         self._wireless_pin = ""
         self._pin_lock = threading.Lock()
+        self._phone_ble_info_at = 0.0
+        self._phone_ble_lock = threading.Lock()
         self._capture: CaptureWriter | None = None
         self.capture_path: Path | None = None
 
@@ -210,9 +212,13 @@ class WirelessCarLinkController:
         ble: IccoaBlePeripheral | IccoaRawBlePeripheral | None = None
         auth_server: asyncio.Server | None = None
         pin_task: asyncio.Task[None] | None = None
+        network_watchdog_task: asyncio.Task[None] | None = None
         video_decoder: VideoDecoder | None = None
         try:
-            self.state("正在启动 Windows 移动热点…")
+            if self.network_mode == "softap":
+                self.state("正在启动 Windows 移动热点…")
+            else:
+                self.state("正在创建 Wi-Fi Direct 车机网络…")
             hotspot_info = await hotspot.start()
             if self.network_mode == "wfd-softap":
                 hotspot_info = replace(
@@ -221,14 +227,17 @@ class WirelessCarLinkController:
                 )
                 self.log("诊断模式：使用 Wi-Fi Direct GO，但向手机声明无线类型 1002")
             self.log(
-                f"Windows 热点已启动：{hotspot_info.ssid}，车机地址 {hotspot_info.address}"
+                f"无线车机网络已启动：{hotspot_info.ssid}，车机地址 {hotspot_info.address}，"
+                f"类型 {hotspot_info.connection_type}，频率 {hotspot_info.frequency} MHz"
             )
             capture.event(
                 "hotspot_started",
+                network_mode=self.network_mode,
                 ssid=hotspot_info.ssid,
                 address=hotspot_info.address,
                 mac=hotspot_info.mac_address,
                 frequency=hotspot_info.frequency,
+                connection_type=hotspot_info.connection_type,
             )
 
             if self.video is not None:
@@ -260,6 +269,7 @@ class WirelessCarLinkController:
             self.state(f"等待 OPPO 手机 · 配对 PIN {initial_pin}")
             self.log("请打开手机的车载服务/Car+，搜索并选择 PC CarLink")
             pin_task = asyncio.create_task(self._rotate_pin())
+            network_watchdog_task = asyncio.create_task(self._watch_network_join(capture))
 
             while not self._stop.is_set():
                 await asyncio.sleep(0.2)
@@ -268,6 +278,12 @@ class WirelessCarLinkController:
                 pin_task.cancel()
                 try:
                     await pin_task
+                except asyncio.CancelledError:
+                    pass
+            if network_watchdog_task is not None:
+                network_watchdog_task.cancel()
+                try:
+                    await network_watchdog_task
                 except asyncio.CancelledError:
                     pass
             if auth_server is not None:
@@ -291,14 +307,48 @@ class WirelessCarLinkController:
             self.state(f"等待 OPPO 手机 · 配对 PIN {pin}")
             self.log("无线配对 PIN 已自动刷新")
 
+    async def _watch_network_join(self, capture: CaptureWriter) -> None:
+        reported_timestamp = 0.0
+        while not self._stop.is_set() and self._auth_session is None:
+            await asyncio.sleep(0.5)
+            with self._phone_ble_lock:
+                phone_ble_info_at = self._phone_ble_info_at
+            if (
+                phone_ble_info_at <= reported_timestamp
+                or time.monotonic() - phone_ble_info_at < 25.0
+            ):
+                continue
+            reported_timestamp = phone_ble_info_at
+            capture.event(
+                "wireless_network_join_timeout",
+                network_mode=self.network_mode,
+                auth_port=AUTH_PORT,
+            )
+            self.log(
+                "P2P 组网超时：BLE 参数已下发，但手机尚未获得 IP 或连接 TCP 57209；"
+                "问题位于 Wi-Fi Direct 二层组网，不是 AUTH"
+            )
+            self.state("P2P 组网超时 · 等待手机重试")
+
     def _on_phone_ble_info(self, info: PhoneBleInfo) -> None:
+        with self._phone_ble_lock:
+            self._phone_ble_info_at = time.monotonic()
+        capture = self._capture
+        if capture is not None:
+            capture.event(
+                "wireless_phone_discovered",
+                phone_name=info.name or info.model,
+                requested_type=info.requested_type,
+                preferred_channel=info.channel,
+                preferred_band=info.band,
+            )
         if info.pin_code:
             self._set_pin(info.pin_code)
         name = info.name or info.model or "OPPO 手机"
         self.log(
             f"BLE 已发现手机：{name}，请求无线类型 {info.requested_type}，首选信道 {info.channel or '自动'}"
         )
-        self.state(f"手机已发现，正在连接热点 · 配对 PIN {self._get_pin()}")
+        self.state(f"手机已发现，正在加入 Wi-Fi Direct · 配对 PIN {self._get_pin()}")
 
     async def _handle_auth_client(
         self,

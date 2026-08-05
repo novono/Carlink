@@ -819,7 +819,7 @@ def main() -> int:
     parser.add_argument(
         "--network-mode",
         choices=("softap", "wfd", "wfd-softap"),
-        default="softap",
+        default="wfd",
         help="Windows network backend and advertised ICCOA type",
     )
     parser.add_argument("--adb", help="Path to adb.exe; auto-detected when omitted")
