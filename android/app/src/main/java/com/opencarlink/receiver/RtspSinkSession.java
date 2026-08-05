@@ -140,11 +140,11 @@ final class RtspSinkSession {
 
     private static byte[] capabilityBody() {
         String value = String.join("\r\n",
-            "wfd_car_display_mode: mode=0;display=1280:720;dpi=320;fps=30",
+            "wfd_car_display_mode: mode=0;display=1280:720;dpi=320;fps=60",
             "wfd_video_formats: " + VIDEO_FORMATS,
             "wfd_audio_codecs: AAC 0000000F 00",
             "wfd_client_rtp_ports: RTP/AVP/TCP;unicast 19000 0 mode=play",
-            "wfd_uibc_capability: input_category_list=GENERIC;generic_cap_list=Keyboard, Mouse, SingleTouch;hidc_cap_list=none;port=none;uibc_encrypted=false",
+            "wfd_uibc_capability: input_category_list=GENERIC;generic_cap_list=Keyboard, Mouse, SingleTouch, MultiTouch;hidc_cap_list=none;port=none;uibc_encrypted=false",
             "ovm_control_capability: supported",
             "wfd_standby_resume_capability: supported"
         ) + "\r\n";

@@ -59,7 +59,7 @@ final class UCarControlProtocol {
             IccoaAuthSession.fieldVarint(4, 320),
             IccoaAuthSession.fieldVarint(5, 1280),
             IccoaAuthSession.fieldVarint(6, 720),
-            IccoaAuthSession.fieldVarint(7, 30),
+            IccoaAuthSession.fieldVarint(7, 60),
             IccoaAuthSession.fieldVarint(8, 1),
             IccoaAuthSession.fieldVarint(11, 149),
             IccoaAuthSession.fieldVarint(12, 1),

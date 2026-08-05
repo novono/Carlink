@@ -105,6 +105,7 @@ public final class CarLinkService extends Service implements WirelessCarLinkEngi
     }
 
     private void stopEngine() {
+        VideoStreamHub.reset();
         WirelessCarLinkEngine value = engine;
         engine = null;
         if (value != null) {
@@ -165,7 +166,11 @@ public final class CarLinkService extends Service implements WirelessCarLinkEngi
         String message
     ) {
         Snapshot next;
+        boolean notificationChanged;
         synchronized (SNAPSHOT_LOCK) {
+            notificationChanged = current.running != running
+                || current.stage != stage
+                || !current.state.equals(state);
             String log = current.log;
             if (appendLog) {
                 String time = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
@@ -178,7 +183,7 @@ public final class CarLinkService extends Service implements WirelessCarLinkEngi
             current = next;
         }
         NotificationManager manager = getSystemService(NotificationManager.class);
-        if (manager != null && running) {
+        if (manager != null && running && notificationChanged) {
             manager.notify(NOTIFICATION_ID, notification(state));
         }
         sendBroadcast(new Intent(ACTION_UPDATE).setPackage(getPackageName()));

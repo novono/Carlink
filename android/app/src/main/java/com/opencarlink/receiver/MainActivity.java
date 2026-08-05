@@ -9,12 +9,14 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowInsets;
@@ -27,29 +29,13 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import androidx.media3.common.MediaItem;
-import androidx.media3.common.MimeTypes;
-import androidx.media3.common.PlaybackException;
-import androidx.media3.common.Player;
-import androidx.media3.common.C;
-import androidx.media3.common.VideoSize;
-import androidx.media3.exoplayer.DefaultLoadControl;
-import androidx.media3.exoplayer.ExoPlayer;
-import androidx.media3.exoplayer.source.ProgressiveMediaSource;
-import androidx.media3.extractor.Extractor;
-import androidx.media3.extractor.ExtractorsFactory;
-import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory;
-import androidx.media3.extractor.ts.TsExtractor;
-import androidx.media3.common.util.TimestampAdjuster;
-import androidx.media3.ui.AspectRatioFrameLayout;
-import androidx.media3.ui.PlayerView;
-
 import java.util.ArrayList;
 import java.util.List;
 
 @SuppressLint("UnsafeOptInUsageError")
 public final class MainActivity extends Activity {
     private static final int PERMISSION_REQUEST = 41;
+    private static final long TOUCH_MOVE_INTERVAL_MS = 16L;
 
     private TextView stateText;
     private TextView detailText;
@@ -57,15 +43,18 @@ public final class MainActivity extends Activity {
     private TextView logText;
     private Button startButton;
     private Button stopButton;
-    private PlayerView videoView;
+    private SurfaceView videoView;
     private View diagnosticView;
     private View playbackLayer;
-    private ExoPlayer player;
-    private boolean decoderReadyReported;
+    private DirectTsVideoDecoder decoder;
     private boolean firstFrameReported;
     private boolean playbackMode;
     private boolean touchActive;
     private long lastTouchMoveMs;
+    private float touchDownViewX;
+    private float touchDownViewY;
+    private long touchDownEventMs;
+    private int touchMoveCount;
     private final TextView[] stageViews = new TextView[4];
 
     private final BroadcastReceiver updates = new BroadcastReceiver() {
@@ -96,8 +85,11 @@ public final class MainActivity extends Activity {
         } else {
             registerReceiver(updates, filter);
         }
-        startPlayer();
-        render(CarLinkService.snapshot());
+        CarLinkService.Snapshot snapshot = CarLinkService.snapshot();
+        if (snapshot.running) {
+            startPlayer();
+        }
+        render(snapshot);
     }
 
     @Override
@@ -206,13 +198,48 @@ public final class MainActivity extends Activity {
         playback.setVisibility(View.GONE);
         playbackLayer = playback;
 
-        videoView = new PlayerView(this);
-        videoView.setUseController(false);
-        videoView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT);
-        videoView.setShutterBackgroundColor(Color.BLACK);
-        videoView.setBackgroundColor(Color.BLACK);
-        videoView.setOnTouchListener(this::handleVideoTouch);
-        playback.addView(videoView, new FrameLayout.LayoutParams(-1, -1));
+        FrameLayout videoHost = new FrameLayout(this);
+        videoHost.setBackgroundColor(Color.BLACK);
+        videoHost.setOnTouchListener(this::handleVideoTouch);
+        videoView = new SurfaceView(this);
+        videoHost.addView(videoView, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+        videoHost.addOnLayoutChangeListener((view, left, top, right, bottom,
+                                              oldLeft, oldTop, oldRight, oldBottom) -> {
+            int width = right - left;
+            int height = bottom - top;
+            float scale = Math.min(
+                width / (float) UibcProtocol.WIDTH,
+                height / (float) UibcProtocol.HEIGHT
+            );
+            FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) videoView.getLayoutParams();
+            int videoWidth = Math.round(UibcProtocol.WIDTH * scale);
+            int videoHeight = Math.round(UibcProtocol.HEIGHT * scale);
+            if (params.width == videoWidth && params.height == videoHeight) {
+                return;
+            }
+            params.width = videoWidth;
+            params.height = videoHeight;
+            params.gravity = Gravity.CENTER;
+            videoView.setLayoutParams(params);
+        });
+        videoView.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override
+            public void surfaceCreated(SurfaceHolder holder) {
+                if (CarLinkService.snapshot().stage >= 8) {
+                    startPlayer();
+                }
+            }
+
+            @Override
+            public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+            }
+
+            @Override
+            public void surfaceDestroyed(SurfaceHolder holder) {
+                stopPlayer();
+            }
+        });
+        playback.addView(videoHost, new FrameLayout.LayoutParams(-1, -1));
 
         Button playbackStop = new Button(this);
         playbackStop.setText("停止");
@@ -232,50 +259,83 @@ public final class MainActivity extends Activity {
     }
 
     private boolean handleVideoTouch(View view, MotionEvent event) {
-        int action = event.getActionMasked();
-        if (action == MotionEvent.ACTION_DOWN) {
-            int[] point = mapVideoPoint(view, event, false);
-            touchActive = point != null
-                && TouchInputHub.sendTouch(UibcProtocol.ACTION_DOWN, point[0], point[1]);
+        int maskedAction = event.getActionMasked();
+        if (maskedAction == MotionEvent.ACTION_DOWN) {
+            int[][] pointers = mapVideoPointers(view, event, false);
+            touchActive = pointers != null && sendTouchEvent(event.getAction(), pointers);
+            if (touchActive) {
+                touchDownViewX = event.getX();
+                touchDownViewY = event.getY();
+                touchDownEventMs = event.getEventTime();
+                touchMoveCount = 0;
+                lastTouchMoveMs = android.os.SystemClock.elapsedRealtime();
+            }
             return touchActive;
         }
         if (!touchActive) {
             return false;
         }
-        if (action == MotionEvent.ACTION_MOVE) {
+        if (maskedAction == MotionEvent.ACTION_MOVE) {
             long now = android.os.SystemClock.elapsedRealtime();
-            if (now - lastTouchMoveMs >= 16L) {
+            if (now - lastTouchMoveMs >= TOUCH_MOVE_INTERVAL_MS) {
                 lastTouchMoveMs = now;
-                int[] point = mapVideoPoint(view, event, true);
-                TouchInputHub.sendTouch(UibcProtocol.ACTION_MOVE, point[0], point[1]);
+                sendTouchEvent(event.getAction(), mapVideoPointers(view, event, true));
+                touchMoveCount++;
             }
             return true;
         }
-        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
-            int[] point = mapVideoPoint(view, event, true);
-            TouchInputHub.sendTouch(UibcProtocol.ACTION_UP, point[0], point[1]);
+        if (maskedAction == MotionEvent.ACTION_POINTER_DOWN
+            || maskedAction == MotionEvent.ACTION_POINTER_UP) {
+            sendTouchEvent(event.getAction(), mapVideoPointers(view, event, true));
+            return true;
+        }
+        if (maskedAction == MotionEvent.ACTION_UP || maskedAction == MotionEvent.ACTION_CANCEL) {
+            int action = maskedAction == MotionEvent.ACTION_CANCEL
+                ? UibcProtocol.ACTION_UP : event.getAction();
+            sendTouchEvent(action, mapVideoPointers(view, event, true));
             touchActive = false;
+            logTouchGesture(event);
             return true;
         }
         return true;
     }
 
-    private int[] mapVideoPoint(View view, MotionEvent event, boolean clamp) {
+    private boolean sendTouchEvent(int action, int[][] pointers) {
+        return TouchInputHub.sendTouch(action, pointers[0], pointers[1], pointers[2]);
+    }
+
+    private void logTouchGesture(MotionEvent event) {
+        Log.i(
+            "OpenCarLinkTouch",
+            "viewDelta=" + Math.round(event.getX() - touchDownViewX)
+                + "," + Math.round(event.getY() - touchDownViewY)
+                + " duration=" + (event.getEventTime() - touchDownEventMs) + "ms"
+                + " moves=" + touchMoveCount
+        );
+    }
+
+    private int[][] mapVideoPointers(View view, MotionEvent event, boolean clamp) {
         float scale = Math.min(
             view.getWidth() / (float) UibcProtocol.WIDTH,
             view.getHeight() / (float) UibcProtocol.HEIGHT
         );
         float left = (view.getWidth() - UibcProtocol.WIDTH * scale) / 2f;
         float top = (view.getHeight() - UibcProtocol.HEIGHT * scale) / 2f;
-        float x = (event.getX() - left) / scale;
-        float y = (event.getY() - top) / scale;
-        if (!clamp && (x < 0 || y < 0 || x >= UibcProtocol.WIDTH || y >= UibcProtocol.HEIGHT)) {
-            return null;
+        int count = event.getPointerCount();
+        int[] ids = new int[count];
+        int[] xs = new int[count];
+        int[] ys = new int[count];
+        for (int index = 0; index < count; index++) {
+            float x = (event.getX(index) - left) / scale;
+            float y = (event.getY(index) - top) / scale;
+            if (!clamp && (x < 0 || y < 0 || x >= UibcProtocol.WIDTH || y >= UibcProtocol.HEIGHT)) {
+                return null;
+            }
+            ids[index] = event.getPointerId(index);
+            xs[index] = Math.max(0, Math.min(UibcProtocol.WIDTH - 1, (int) x));
+            ys[index] = Math.max(0, Math.min(UibcProtocol.HEIGHT - 1, (int) y));
         }
-        return new int[]{
-            Math.max(0, Math.min(UibcProtocol.WIDTH - 1, (int) x)),
-            Math.max(0, Math.min(UibcProtocol.HEIGHT - 1, (int) y))
-        };
+        return new int[][]{ids, xs, ys};
     }
 
     @Override
@@ -352,6 +412,11 @@ public final class MainActivity extends Activity {
         playbackLayer.setVisibility(streaming ? View.VISIBLE : View.GONE);
         diagnosticView.setVisibility(streaming ? View.GONE : View.VISIBLE);
         setPlaybackMode(streaming);
+        if (streaming) {
+            startPlayer();
+        } else {
+            stopPlayer();
+        }
         for (int index = 0; index < stageViews.length; index++) {
             boolean reached = snapshot.stage > index;
             stageViews[index].setTextColor(
@@ -395,84 +460,49 @@ public final class MainActivity extends Activity {
     }
 
     private void startPlayer() {
-        if (player != null) {
+        if (decoder != null || videoView == null || !videoView.getHolder().getSurface().isValid()) {
             return;
         }
-        decoderReadyReported = false;
         firstFrameReported = false;
-        DefaultLoadControl loadControl = new DefaultLoadControl.Builder()
-            .setBufferDurationsMs(100, 300, 25, 75)
-            .setPrioritizeTimeOverSizeThresholds(true)
-            .build();
-        ExoPlayer value = new ExoPlayer.Builder(this)
-            .setLoadControl(loadControl)
-            .build();
-        player = value;
-        videoView.setPlayer(value);
-        value.setTrackSelectionParameters(
-            value.getTrackSelectionParameters().buildUpon()
-                .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
-                .build()
-        );
-        value.addListener(new Player.Listener() {
+        DirectTsVideoDecoder value = new DirectTsVideoDecoder(
+            videoView.getHolder().getSurface(),
+            new DirectTsVideoDecoder.Listener() {
             @Override
-            public void onPlaybackStateChanged(int playbackState) {
-                if (playbackState == Player.STATE_READY && !decoderReadyReported) {
-                    decoderReadyReported = true;
-                    reportVideoStatus("Android 视频解码器已就绪，等待首帧");
-                }
-            }
-
-            @Override
-            public void onVideoSizeChanged(VideoSize videoSize) {
+            public void onDecoderReady(String codecName, boolean lowLatency) {
                 reportVideoStatus(
-                    "识别视频画面：" + videoSize.width + "x" + videoSize.height
+                    "直通硬件解码器已就绪：" + codecName
+                        + (lowLatency ? "（低延迟模式）" : "")
                 );
             }
 
             @Override
-            public void onRenderedFirstFrame() {
+            public void onVideoSize(int width, int height) {
+                reportVideoStatus("识别视频画面：" + width + "x" + height);
+            }
+
+            @Override
+            public void onFirstFrame() {
                 if (!firstFrameReported) {
                     firstFrameReported = true;
-                    reportVideoStatus("首帧已渲染，画面开始显示");
+                    reportVideoStatus("首帧已直通渲染，画面开始显示");
                 }
             }
 
             @Override
-            public void onPlayerError(PlaybackException error) {
-                reportVideoStatus("视频解码失败：" + error.getErrorCodeName());
+            public void onError(String message) {
+                reportVideoStatus(message);
             }
-        });
-        int tsFlags = DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS
-            | DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES
-            | DefaultTsPayloadReaderFactory.FLAG_IGNORE_AAC_STREAM;
-        ExtractorsFactory extractorsFactory = () -> new Extractor[]{
-            new TsExtractor(
-                TsExtractor.MODE_SINGLE_PMT,
-                new TimestampAdjuster(0),
-                new DefaultTsPayloadReaderFactory(tsFlags)
-            )
-        };
-        ProgressiveMediaSource source = new ProgressiveMediaSource.Factory(
-            CarLinkVideoDataSource::new,
-            extractorsFactory
-        ).createMediaSource(
-            new MediaItem.Builder()
-                .setUri(Uri.parse("carlink://live/stream.ts"))
-                .setMimeType(MimeTypes.VIDEO_MP2T)
-                .build()
+            }
         );
-        value.setMediaSource(source);
-        value.setPlayWhenReady(true);
-        value.prepare();
+        decoder = value;
+        value.start();
     }
 
     private void stopPlayer() {
-        ExoPlayer value = player;
-        player = null;
-        videoView.setPlayer(null);
+        DirectTsVideoDecoder value = decoder;
+        decoder = null;
         if (value != null) {
-            value.release();
+            value.stop();
         }
     }
 

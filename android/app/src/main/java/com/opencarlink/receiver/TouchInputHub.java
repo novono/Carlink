@@ -18,10 +18,14 @@ final class TouchInputHub {
     }
 
     static boolean sendTouch(int action, int x, int y) {
+        return sendTouch(action, new int[]{0}, new int[]{x}, new int[]{y});
+    }
+
+    static boolean sendTouch(int action, int[] trackIds, int[] xs, int[] ys) {
         Sender sender = ACTIVE.get();
         return sender != null && sender.send(
-            UibcProtocol.touch(action, x, y),
-            action == UibcProtocol.ACTION_MOVE
+            UibcProtocol.touch(action, trackIds, xs, ys),
+            (action & 0xff) == UibcProtocol.ACTION_MOVE
         );
     }
 

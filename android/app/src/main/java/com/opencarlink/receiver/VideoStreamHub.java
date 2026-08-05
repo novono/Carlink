@@ -13,6 +13,7 @@ final class VideoStreamHub {
 
     static void beginSession() {
         synchronized (LOCK) {
+            closeActiveReaderLocked();
             QUEUE.clear();
             headOffset = 0;
             bufferedBytes = 0;
@@ -42,19 +43,32 @@ final class VideoStreamHub {
 
     static void endSession() {
         synchronized (LOCK) {
+            closeActiveReaderLocked();
+            QUEUE.clear();
+            headOffset = 0;
+            bufferedBytes = 0;
             ended = true;
             LOCK.notifyAll();
         }
     }
 
+    static void reset() {
+        endSession();
+    }
+
     static Reader openReader() {
         synchronized (LOCK) {
-            if (activeReader != null) {
-                activeReader.closed = true;
-            }
+            closeActiveReaderLocked();
             activeReader = new Reader();
             LOCK.notifyAll();
             return activeReader;
+        }
+    }
+
+    private static void closeActiveReaderLocked() {
+        if (activeReader != null) {
+            activeReader.closed = true;
+            activeReader = null;
         }
     }
 

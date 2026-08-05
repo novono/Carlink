@@ -395,7 +395,6 @@ final class WirelessCarLinkEngine {
         }
         sessionChannels = new WirelessSessionChannels(
             identity,
-            context.getExternalFilesDir(null),
             new WirelessSessionChannels.Callback() {
             @Override
             public void onLog(String message) {

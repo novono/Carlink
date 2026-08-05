@@ -29,6 +29,24 @@ public final class UibcProtocolTest {
     }
 
     @Test
+    public void multiTouchIncludesStablePointerIdsAndCoordinates() {
+        assertEquals(
+            "{\"type\":1,\"action\":261,\"width\":1280,\"height\":720,"
+                + "\"count\":2,\"trackID0\":4,\"x0\":100,\"y0\":200,"
+                + "\"trackID1\":9,\"x1\":1279,\"y1\":0}",
+            new String(
+                UibcProtocol.touch(
+                    261,
+                    new int[]{4, 9},
+                    new int[]{100, 2000},
+                    new int[]{200, -1}
+                ),
+                StandardCharsets.UTF_8
+            )
+        );
+    }
+
+    @Test
     public void touchRejectsUnknownAction() {
         assertThrows(IllegalArgumentException.class, () -> UibcProtocol.touch(3, 1, 2));
     }

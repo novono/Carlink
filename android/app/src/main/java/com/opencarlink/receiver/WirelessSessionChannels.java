@@ -1,6 +1,7 @@
 package com.opencarlink.receiver;
 
 import android.os.SystemClock;
+import android.util.Log;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -44,7 +45,7 @@ final class WirelessSessionChannels {
     private volatile Socket uibcSocket;
     private volatile boolean stopped;
 
-    WirelessSessionChannels(IccoaProtocol.Identity identity, java.io.File captureDirectory, Callback callback) {
+    WirelessSessionChannels(IccoaProtocol.Identity identity, Callback callback) {
         this.identity = identity;
         this.callback = callback;
     }
@@ -126,7 +127,11 @@ final class WirelessSessionChannels {
             if (replaceable && last != null && last.replaceable) {
                 uibcQueue.removeLast();
             }
-            uibcQueue.addLast(new UibcWrite(payload.clone(), replaceable));
+            uibcQueue.addLast(new UibcWrite(
+                payload.clone(),
+                replaceable,
+                SystemClock.elapsedRealtime()
+            ));
             uibcQueueLock.notifyAll();
             return true;
         }
@@ -147,6 +152,13 @@ final class WirelessSessionChannels {
                 write = uibcQueue.pollFirst();
             }
             if (write != null) {
+                long waitMs = SystemClock.elapsedRealtime() - write.enqueuedAtMs;
+                if (!write.replaceable || waitMs >= 10L) {
+                    Log.i(
+                        "OpenCarLinkLatency",
+                        "uibc replaceable=" + write.replaceable + " queueWait=" + waitMs + "ms"
+                    );
+                }
                 writeUibc(write.payload);
             }
         }
@@ -168,10 +180,12 @@ final class WirelessSessionChannels {
     private static final class UibcWrite {
         final byte[] payload;
         final boolean replaceable;
+        final long enqueuedAtMs;
 
-        UibcWrite(byte[] payload, boolean replaceable) {
+        UibcWrite(byte[] payload, boolean replaceable, long enqueuedAtMs) {
             this.payload = payload;
             this.replaceable = replaceable;
+            this.enqueuedAtMs = enqueuedAtMs;
         }
     }
 
