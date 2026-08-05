@@ -41,6 +41,39 @@ class WirelessProtocolTests(unittest.TestCase):
             ("Local Area Connection* 11", "192.168.137.1", "4a:d5:7a:ce:c5:bf"),
         )
 
+    @patch("open_carlink_pc.wireless._network_interface_details")
+    def test_group_owner_can_reuse_existing_standard_interface(self, interfaces) -> None:
+        interfaces.return_value = [
+            ("Ethernet", "10.11.0.42", "74:86:e2:18:e0:e6"),
+            ("Local Area Connection* 11", "192.168.137.1", "4a:d5:7a:ce:c5:bf"),
+        ]
+        previous = {
+            "Ethernet": "10.11.0.42",
+            "Local Area Connection* 11": "192.168.137.1",
+        }
+
+        self.assertIsNone(_new_group_owner_interface(previous))
+        self.assertEqual(
+            _new_group_owner_interface(
+                previous,
+                allow_existing_standard_address=True,
+            ),
+            ("Local Area Connection* 11", "192.168.137.1", "4a:d5:7a:ce:c5:bf"),
+        )
+
+    @patch("open_carlink_pc.wireless._network_interface_details")
+    def test_group_owner_ignores_unrelated_existing_private_interface(self, interfaces) -> None:
+        interfaces.return_value = [
+            ("VPN", "172.16.20.1", "00:11:22:33:44:55"),
+        ]
+
+        self.assertIsNone(
+            _new_group_owner_interface(
+                {"VPN": "172.16.20.1"},
+                allow_existing_standard_address=True,
+            )
+        )
+
     def test_primary_service_data_matches_coloros_layout(self) -> None:
         identity = CarIdentity(
             car_id="010203040506",

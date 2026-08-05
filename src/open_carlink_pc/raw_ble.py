@@ -10,8 +10,10 @@ import usb.core
 import usb.util
 
 
-QCA9377_VENDOR_ID = 0x0CF3
-QCA9377_PRODUCT_ID = 0xE009
+RAW_HCI_USB_DEVICES = (
+    (0x0CF3, 0xE009, "Qualcomm QCA9377"),
+    (0x13D3, 0x3558, "Realtek 8821CE Bluetooth"),
+)
 
 ICCOA_ADVERTISEMENT_UUID16 = 0xFCFB
 ICCOA_PRIMARY_DATA_UUID16 = 0x0001
@@ -38,10 +40,11 @@ def _uuid16(value: int) -> bytes:
 
 
 class RawHciController:
-    """Minimal USB HCI transport for a QCA9377 temporarily bound to WinUSB."""
+    """Minimal transport for a supported USB Bluetooth HCI bound to WinUSB."""
 
     def __init__(self) -> None:
         self.device = None
+        self.device_name = ""
         self.connection_handle: int | None = None
         self.acl_data_length = 27
         self._event_queue: list[bytes] = []
@@ -50,33 +53,56 @@ class RawHciController:
 
     def open(self) -> None:
         backend = libusb_package.get_libusb1_backend()
-        device = usb.core.find(
-            idVendor=QCA9377_VENDOR_ID,
-            idProduct=QCA9377_PRODUCT_ID,
-            backend=backend,
+        failures: list[str] = []
+        for vendor_id, product_id, name in RAW_HCI_USB_DEVICES:
+            device = usb.core.find(
+                idVendor=vendor_id,
+                idProduct=product_id,
+                backend=backend,
+            )
+            if device is None:
+                continue
+            try:
+                try:
+                    device.set_configuration()
+                except usb.core.USBError:
+                    # A configuration may already be active after the driver switch.
+                    pass
+                usb.util.claim_interface(device, 0)
+            except (usb.core.USBError, NotImplementedError) as exc:
+                failures.append(f"{name}: {exc}")
+                try:
+                    usb.util.dispose_resources(device)
+                except (usb.core.USBError, NotImplementedError):
+                    pass
+                continue
+            self.device = device
+            self.device_name = name
+            return
+        if failures:
+            raise RawBleError(
+                "找到支持的蓝牙控制器，但无法占用 WinUSB HCI 接口："
+                + "; ".join(failures)
+            )
+        supported = ", ".join(
+            f"{name} ({vendor_id:04X}:{product_id:04X})"
+            for vendor_id, product_id, name in RAW_HCI_USB_DEVICES
         )
-        if device is None:
-            raise RawBleError("未找到已切换为 WinUSB 的 Qualcomm QCA9377 蓝牙设备")
-        try:
-            device.set_configuration()
-        except usb.core.USBError:
-            # A configuration may already be active after the driver switch.
-            pass
-        try:
-            usb.util.claim_interface(device, 0)
-        except usb.core.USBError as exc:
-            raise RawBleError(f"无法占用 QCA9377 HCI 接口：{exc}") from exc
-        self.device = device
+        raise RawBleError(f"未找到已切换为 WinUSB 的支持控制器：{supported}")
 
     def close(self) -> None:
         device = self.device
         self.device = None
+        self.device_name = ""
         if device is not None:
             try:
                 usb.util.release_interface(device, 0)
-            except usb.core.USBError:
+            except (usb.core.USBError, NotImplementedError):
                 pass
-            usb.util.dispose_resources(device)
+            try:
+                usb.util.dispose_resources(device)
+            except (usb.core.USBError, NotImplementedError):
+                pass
 
     def _require_device(self):
         if self.device is None:

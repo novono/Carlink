@@ -58,7 +58,9 @@ AUTH、CONTROL、RTSP、视频和 UIBC 的上层逻辑可以复用。USB 与无�
 | ICCOA BLE 广播 | 已验证 | ColorOS 命中 `PC CarLink` |
 | 原始 ATT/GATT | 已验证 | 手机写入 Client Info，接收 Server Info |
 | Windows ICCOA P2P 组网 | 未完成 | 手机进入 ASSOCIATING，但 10 秒后 group formation 超时 |
-| 无线 AUTH 及投屏 | 未到达 | 手机尚未通过 P2P 获得 IP，也未连接 TCP 57209 |
+| Android ICCOA BLE/P2P | 已验证 | 魅族 20 创建 autonomous GO，OPPO 写入 Client Info、确认 Server Info 并获得 P2P 地址 |
+| Android 无线 AUTH | 已验证 | OPPO 连接 TCP 57209，完成首次密钥协商和 AUTH_CONFIRM |
+| Android 无线投屏 | 未实现 | CONTROL、RTSP、RTP/视频和 UIBC 尚未移植到 APK |
 
 ## 2. 工程环境与工具
 
@@ -72,7 +74,7 @@ AUTH、CONTROL、RTSP、视频和 UIBC 的上层逻辑可以复用。USB 与无�
 - 无线 BLE 原始 HCI 调试需要一只可由 WinUSB 接管的 BLE 控制器。
 - 无线 P2P 最好准备独立 USB Wi-Fi 网卡；普通“支持热点”不等于支持可控的 Wi-Fi Direct GO。
 
-本项目实测硬件：
+原始端到端基线硬件：
 
 ```text
 手机：OPPO PKT110
@@ -81,6 +83,18 @@ AOA：18D1:2D01
 电脑 Wi-Fi：Qualcomm QCA9377 802.11ac
 电脑蓝牙 USB：0CF3:E009
 ```
+
+2026-08-05 当前开发机：
+
+```text
+电脑 Wi-Fi：Realtek 8821CE，驱动 2024.10.141.0
+电脑蓝牙 USB：Realtek 13D3:3558，原厂驱动 1.1061.2312.2501
+```
+
+当前 Realtek Wi-Fi 已验证能够创建 autonomous GO，并获得
+`192.168.137.1 / 信道 11 / 2462 MHz`。Realtek 蓝牙原始 HCI 已加入实验支持，
+但尚未替换为 WinUSB 做手机实机验证；原厂驱动下会安全回退到 WinRT，而 WinRT
+仍报告 INFO1/INFO2 为 `STARTED_WITHOUT_ALL_ADVERTISEMENT_DATA`。
 
 ### 2.2 Python 依赖
 
@@ -1193,6 +1207,37 @@ Concurrent channels      2
 
 Windows Mobile Hotspot 仍能通过 Wi-Fi Direct 虚拟适配器启动，但 `Soft AP: Not supported` 暗示驱动的旧 SoftAP/可控 AP 能力有限。ColorOS 需要的 P2P fast-connect 参数可能没有被 Windows 高层 API 暴露。
 
+### 17.7 Realtek 8821CE 当前开发机证据
+
+在 Realtek 8821CE（驱动 `2024.10.141.0`）上，当前代码短启动已确认：
+
+```text
+Wi-Fi Direct GO publisher = STARTED
+GO interface = 本地连接* 10
+IPv4 = 192.168.137.1
+channel = 11
+frequency = 2462 MHz
+ICCOA type = 1001
+AUTH listener = 0.0.0.0:57209
+```
+
+这证明网络创建、真实接口选择、信道查询和 AUTH 监听都能在当前网卡上完成，
+但没有手机参与，不能据此宣称 P2P group formation 已打通。
+
+当前蓝牙为 Realtek `13D3:3558`。原厂驱动下 libusb 返回
+`NotImplementedError: Operation not supported or unimplemented on this platform`；
+controller 会把它识别为原始 HCI 不可用并回退到 WinRT。WinRT 实测状态仍是：
+
+```text
+FCFB  = STARTED
+INFO1 = STARTED_WITHOUT_ALL_ADVERTISEMENT_DATA
+INFO2 = STARTED_WITHOUT_ALL_ADVERTISEMENT_DATA
+```
+
+因此 Realtek 路径的下一步是先备份 `oem48.inf`，精确对
+`USB\VID_13D3&PID_3558` 做 WinUSB 接管并验证原始广播；不要把 WinRT 的启动状态
+当作空中 payload 已完整发出。WinUSB 接管期间 Windows 普通蓝牙不可用。
+
 ## 18. 当前无线阻塞点与下一步
 
 当前阻塞点可精确描述为：
@@ -1267,7 +1312,7 @@ Linux 路线的价值是能够控制 P2P GO、WPS、operating channel、P2P IE �
 
 ### 18.4 Wi-Fi 成功后的认证待办
 
-当前无线 controller 使用每 120 秒刷新的六位数字 PIN，这与官方车机实现一致。但 ColorOS 实机日志还出现过一个独立的 8 字符 `pinCodeOrAuthentication`，而本次 Client Info JSON 没稳定带出该字段。
+当前无线 controller 使用每 120 秒刷新的六位数字 PIN，这与官方车机实现一致。BLE 后端默认优先尝试原始 USB HCI；QCA9377 `0CF3:E009` 是已验证路径，当前开发机的 Realtek 8821CE Bluetooth `13D3:3558` 已加入实验支持，但仍需在备份原厂驱动并由 WinUSB 精确接管后做实机验证。控制器不存在或不可用时会回退到 WinRT 兼容路径，并在日志中明确提示必须用手机验证空中广播完整性。ColorOS 实机日志还出现过一个独立的 8 字符 `pinCodeOrAuthentication`，而本次 Client Info JSON 没稳定带出该字段。
 
 因此 Wi-Fi 打通后，AUTH 仍需验证：
 
@@ -1277,6 +1322,29 @@ Linux 路线的价值是能够控制 P2P GO、WPS、operating channel、P2P IE �
 - 必要时清理单个测试车机配对状态，而不是重置整个手机网络。
 
 在手机尚未连接 TCP 57209 之前，不要把问题归因于 AUTH PIN。
+
+### 18.5 魅族 20 Android 接收端验证
+
+项目的 `android/` 目录提供了一个不依赖 Python、AndroidX 或第三方运行库的原生 Android 调试接收端。它用于绕开 Windows 无法稳定控制 P2P GO 的限制，在魅族 20 上按本章顺序执行：
+
+1. 创建 `DIRECT-xx-MeizuCarLink` Wi-Fi Direct autonomous GO。
+2. 读取系统实际返回的 SSID、PSK、IPv4 地址和频率。
+3. 监听 `0.0.0.0:57209`。
+4. 注册 ICCOA Share GATT service，广播 FCFB、INFO1 和 INFO2。
+5. 接收 OPPO Client Info，并以 indication 下发真实 Server Info。
+6. 检测 OPPO 是否加入 P2P 网络并连接 AUTH。
+
+调试 APK 生成在：
+
+```text
+android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+测试前在魅族 20 上打开 Wi-Fi、蓝牙和定位，关闭个人热点。安装并启动 `OpenCarLink Receiver`，授予附近设备、蓝牙和通知权限，点击“启动接收”。等 `P2P GO`、`BLE` 变绿后，再在 OPPO 手机上启动 Car+ 搜索 `Meizu CarLink`。
+
+界面四格对应独立验收层：`P2P GO` 表示组和 AUTH listener 已就绪，`BLE` 表示广播已启动，`手机` 表示 Client Info 已收到，`AUTH` 表示手机已经实际连接 TCP `57209`。测试后应记录最后变绿的格子和完整“现场日志”，不要只报告“连不上”。
+
+当前 APK 已包含完整 AUTH 协商和确认，但尚未包含 CONTROL、RTSP、RTP/视频和 UIBC。2026-08-05 使用魅族 20 实测时，OPPO 已确认 Server Info、加入 P2P 网络、连接 TCP `57209` 并完成首次密钥协商与 AUTH_CONFIRM。无线认证成功仍不等同于已经能够投屏，下一验收点是加密 CONTROL 配置和心跳。
 
 ## 19. 测试策略
 

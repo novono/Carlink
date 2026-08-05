@@ -21,6 +21,7 @@ from .video import RtpMpegTsExtractor, VideoDecoder
 from .wireless import (
     IccoaBlePeripheral,
     IccoaRawBlePeripheral,
+    HotspotInfo,
     PhoneBleInfo,
     WindowsMobileHotspot,
     WindowsWiFiDirectGroupOwner,
@@ -40,6 +41,8 @@ RTP_PORT = 15550
 UIBC_PORT = 4321
 NetworkMode = Literal["softap", "wfd", "wfd-softap"]
 NETWORK_MODES = frozenset(("softap", "wfd", "wfd-softap"))
+BleMode = Literal["auto", "raw", "winrt"]
+BLE_MODES = frozenset(("auto", "raw", "winrt"))
 
 
 class WirelessCarLinkController:
@@ -50,14 +53,18 @@ class WirelessCarLinkController:
         state: Callable[[str], None],
         video: Callable[[Image.Image], None] | None = None,
         network_mode: NetworkMode = "wfd",
+        ble_mode: BleMode = "auto",
     ) -> None:
         if network_mode not in NETWORK_MODES:
             raise ValueError(f"不支持的无线网络模式：{network_mode}")
+        if ble_mode not in BLE_MODES:
+            raise ValueError(f"不支持的 BLE 后端：{ble_mode}")
         self.identity = identity
         self.log = log
         self.state = state
         self.video = video
         self.network_mode = network_mode
+        self.ble_mode = ble_mode
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._sockets: set[socket.socket] = set()
@@ -258,14 +265,9 @@ class WirelessCarLinkController:
             )
             self.log(f"无线认证服务已监听 TCP {AUTH_PORT}")
 
-            ble = IccoaRawBlePeripheral(
-                self.identity,
-                hotspot_info,
-                self.log,
-                self._on_phone_ble_info,
-            )
             self.state("正在启动 ICCOA 蓝牙广播…")
-            await ble.start()
+            ble, ble_backend = await self._start_ble(hotspot_info)
+            capture.event("wireless_ble_started", backend=ble_backend)
             self.state(f"等待 OPPO 手机 · 配对 PIN {initial_pin}")
             self.log("请打开手机的车载服务/Car+，搜索并选择 PC CarLink")
             pin_task = asyncio.create_task(self._rotate_pin())
@@ -294,6 +296,50 @@ class WirelessCarLinkController:
             await hotspot.stop()
             if video_decoder is not None:
                 video_decoder.stop()
+
+    async def _start_ble(
+        self,
+        hotspot_info: HotspotInfo,
+    ) -> tuple[IccoaBlePeripheral | IccoaRawBlePeripheral, str]:
+        candidates: list[
+            tuple[str, type[IccoaBlePeripheral] | type[IccoaRawBlePeripheral]]
+        ]
+        if self.ble_mode == "raw":
+            candidates = [("raw-hci", IccoaRawBlePeripheral)]
+        elif self.ble_mode == "winrt":
+            candidates = [("winrt", IccoaBlePeripheral)]
+        else:
+            candidates = [
+                ("raw-hci", IccoaRawBlePeripheral),
+                ("winrt", IccoaBlePeripheral),
+            ]
+
+        errors: list[str] = []
+        for backend, peripheral_type in candidates:
+            peripheral = peripheral_type(
+                self.identity,
+                hotspot_info,
+                self.log,
+                self._on_phone_ble_info,
+            )
+            try:
+                await peripheral.start()
+            except (OSError, WirelessError, ValueError) as exc:
+                await peripheral.stop()
+                errors.append(f"{backend}: {exc}")
+                if self.ble_mode == "auto" and backend == "raw-hci":
+                    self.log(
+                        "未找到可用的 WinUSB 原始 HCI，改用 Windows BLE 兼容后端；"
+                        "请以手机是否能发现 FCFB 广播为准"
+                    )
+                continue
+            if backend == "raw-hci":
+                self.log("BLE 后端：原始 USB HCI（QCA9377 已验证，Realtek 待实机验证）")
+            else:
+                self.log("BLE 后端：Windows WinRT（兼容路径，需实机确认空中广播完整）")
+            return peripheral, backend
+
+        raise WirelessError("ICCOA BLE 广播启动失败：" + "; ".join(errors))
 
     async def _rotate_pin(self) -> None:
         elapsed = 0.0

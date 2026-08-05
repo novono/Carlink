@@ -35,6 +35,24 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 4. 等待 AOA、认证、RTSP 和视频链路建立；状态变为“投屏中”后窗口显示手机的真实车载桌面。
 5. 直接在画面中点击或拖动，工具栏可发送返回和车载主页按键。
 
+## Android 无线实验 APK
+
+魅族 20 可以作为临时车机接收端，用 OPPO 手机上的 Car+ 验证 Android 原生 Wi-Fi Direct、BLE/GATT、入网和 AUTH 连接。当前调试 APK 位于：
+
+```text
+android\app\build\outputs\apk\debug\app-debug.apk
+```
+
+实机测试步骤：
+
+1. 把 APK 安装到魅族 20；若 Flyme 拦截安装，允许当前文件管理器“安装未知应用”。
+2. 同时打开魅族 20 的 Wi-Fi、蓝牙和定位，关闭个人热点；启动 `OpenCarLink Receiver`。
+3. 点击“启动接收”，允许“附近设备”、蓝牙和通知权限，不要切走或锁屏。
+4. 等界面中的 `P2P GO` 和 `BLE` 变绿后，在 OPPO 手机上打开 Car+ 并搜索 `Meizu CarLink`。
+5. 记录最后变绿的进度格和“现场日志”。`手机` 变绿表示 Client Info 已到达；`AUTH` 变绿表示 OPPO 已加入 P2P 网络并连接 TCP `57209`。
+
+这是无线传输分层验证版，目前只实现到 AUTH 入口；即使四格全部变绿，也还不会显示 Car+ 画面。后续仍需接入完整 AUTH、CONTROL、RTSP、RTP/视频和 UIBC。
+
 ## Windows 驱动
 
 手机切换到 AOA 后，只为以下数据接口绑定 WinUSB：
@@ -58,6 +76,6 @@ $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 
 ## 边界
 
-- 无线 BLE/GATT 及 TCP 上层通道保留为实验模式，Windows P2P 组网尚未端到端打通。
+- 无线 BLE/GATT 及 TCP 上层通道保留为实验模式，Windows P2P 组网尚未端到端打通。无线启动会优先使用 WinUSB 原始 HCI（QCA9377 已验证，Realtek `13D3:3558` 为实验支持）；找不到可用控制器时自动回退到 WinRT BLE 兼容后端，仍须以手机实机发现结果为准。替换蓝牙驱动前必须备份原厂驱动，WinUSB 接管期间 Windows 普通蓝牙不可用。
 - 暂未实现音频输出、麦克风、蓝牙电话、传感器和方向盘按键。
 - 完整负载可能包含导航、媒体、联系人或通话信息，只应在明确需要时开启。

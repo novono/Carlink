@@ -7,4 +7,11 @@ __pycache__/
 build/
 dist/
 *.spec.local
+.android-sdk/
+.jdk/
+.gradle-dist/
+android/.gradle/
+android/local.properties
+android/app/build/
+android/build/
 

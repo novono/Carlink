@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from open_carlink_pc.config import CarIdentity
+from open_carlink_pc.wireless import HotspotInfo, WirelessError
 from open_carlink_pc.wireless_controller import WirelessCarLinkController
 from tools.wireless_diagnostic import (
     _classify_phone_line,
@@ -32,6 +35,74 @@ class WirelessDiagnosticTests(unittest.TestCase):
                 lambda _value: None,
                 network_mode="unknown",  # type: ignore[arg-type]
             )
+
+        with self.assertRaisesRegex(ValueError, "不支持的 BLE 后端"):
+            WirelessCarLinkController(
+                identity,
+                lambda _value: None,
+                lambda _value: None,
+                ble_mode="unknown",  # type: ignore[arg-type]
+            )
+
+    def test_auto_ble_falls_back_to_winrt(self) -> None:
+        identity = CarIdentity(
+            car_id="001122334455",
+            model_id="001122334455",
+            protocol_version="1.2",
+            short_name="PC CarLink",
+            vendor_data="0000",
+        )
+        logs: list[str] = []
+        controller = WirelessCarLinkController(
+            identity,
+            logs.append,
+            lambda _value: None,
+        )
+        hotspot = HotspotInfo(
+            ssid="DIRECT-AA-OpenCarLink",
+            passphrase="secret123",
+            address="192.168.137.1",
+            mac_address="02:00:00:00:00:00",
+        )
+
+        class FailedRawBle:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            async def start(self) -> None:
+                raise WirelessError("raw unavailable")
+
+            async def stop(self) -> None:
+                pass
+
+        class WorkingWinRtBle:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            async def start(self) -> None:
+                pass
+
+            async def stop(self) -> None:
+                pass
+
+        async def run_fallback() -> tuple[object, str]:
+            with (
+                patch(
+                    "open_carlink_pc.wireless_controller.IccoaRawBlePeripheral",
+                    FailedRawBle,
+                ),
+                patch(
+                    "open_carlink_pc.wireless_controller.IccoaBlePeripheral",
+                    WorkingWinRtBle,
+                ),
+            ):
+                return await controller._start_ble(hotspot)
+
+        peripheral, backend = asyncio.run(run_fallback())
+
+        self.assertIsInstance(peripheral, WorkingWinRtBle)
+        self.assertEqual(backend, "winrt")
+        self.assertTrue(any("改用 Windows BLE" in message for message in logs))
 
     def test_sanitize_redacts_phone_authentication_variants(self) -> None:
         source = (

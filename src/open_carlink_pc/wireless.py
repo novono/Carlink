@@ -123,19 +123,27 @@ def _network_interface_details() -> list[tuple[str, str, str]]:
 
 def _new_group_owner_interface(
     previous_addresses: dict[str, str],
+    *,
+    allow_existing_standard_address: bool = False,
 ) -> tuple[str, str, str] | None:
-    candidates = [
+    interfaces = _network_interface_details()
+    changed = [
         details
-        for details in _network_interface_details()
+        for details in interfaces
         if details[1] and previous_addresses.get(details[0]) != details[1]
     ]
-    preferred = next((details for details in candidates if details[1] == "192.168.137.1"), None)
-    if preferred is not None:
+    preferred = next(
+        (details for details in interfaces if details[1] == "192.168.137.1"),
+        None,
+    )
+    if preferred is not None and (
+        allow_existing_standard_address or preferred in changed
+    ):
         return preferred
     return next(
         (
             details
-            for details in candidates
+            for details in changed
             if details[1].startswith(("192.168.", "172.16.", "172.17."))
         ),
         None,
@@ -307,34 +315,11 @@ class WindowsMobileHotspot:
         self._manager: NetworkOperatorTetheringManager | None = None
         self._started_here = False
 
-    @staticmethod
-    def _interface_details() -> tuple[str, str, str]:
-        fallback_address = "192.168.137.1"
-        fallback_mac = "02:00:00:00:00:00"
-        candidates: list[tuple[str, str, str]] = []
-        for interface_name, ipv4, mac in _network_interface_details():
-            if ipv4:
-                candidates.append((interface_name, ipv4, mac))
-        preferred = next((item for item in candidates if item[1] == fallback_address), None)
-        if preferred is None:
-            preferred = next(
-                (
-                    item
-                    for item in candidates
-                    if item[1].startswith(("192.168.", "172.16.", "172.17."))
-                ),
-                None,
-            )
-        if preferred is None:
-            return "", fallback_address, fallback_mac
-        return preferred[0], preferred[1], preferred[2] or fallback_mac
-
-    @staticmethod
-    def _interface_info() -> tuple[str, str]:
-        _name, address, mac_address = WindowsMobileHotspot._interface_details()
-        return address, mac_address
-
     async def start(self) -> HotspotInfo:
+        previous_addresses = {
+            interface_name: ipv4
+            for interface_name, ipv4, _mac_address in _network_interface_details()
+        }
         profile = NetworkInformation.get_internet_connection_profile()
         if profile is None:
             raise WirelessError("电脑当前没有可共享的网络连接")
@@ -357,8 +342,12 @@ class WindowsMobileHotspot:
 
         for _ in range(40):
             if manager.tethering_operational_state == TetheringOperationalState.ON:
-                interface_name, address, _mac_address = self._interface_details()
-                if address:
+                interface = _new_group_owner_interface(
+                    previous_addresses,
+                    allow_existing_standard_address=True,
+                )
+                if interface is not None:
+                    interface_name, address, _mac_address = interface
                     current = manager.get_current_access_point_configuration()
                     frequency = _wlan_interface_frequency(interface_name) or 2412
                     channel = 14 if frequency == 2484 else (frequency - 2407) // 5
@@ -376,7 +365,7 @@ class WindowsMobileHotspot:
                         connection_type=WIRELESS_TYPE_SOFT_AP,
                     )
             await asyncio.sleep(0.25)
-        raise WirelessError("Windows 移动热点启动超时")
+        raise WirelessError("Windows 移动热点已启动，但没有找到真实的热点 IPv4 接口")
 
     async def stop(self) -> None:
         manager = self._manager
@@ -523,7 +512,10 @@ class WindowsWiFiDirectGroupOwner:
         self.log("Wi-Fi Direct GO 已进入密集可发现状态，配置方式 WPS PBC")
 
         for _ in range(60):
-            interface = _new_group_owner_interface(previous_addresses)
+            interface = _new_group_owner_interface(
+                previous_addresses,
+                allow_existing_standard_address=True,
+            )
             if interface is not None:
                 interface_name, address, mac_address = interface
                 frequency = _wlan_interface_frequency(interface_name) or 2412
@@ -810,7 +802,7 @@ class IccoaBlePeripheral:
 
 
 class IccoaRawBlePeripheral:
-    """ICCOA peripheral backed by direct QCA9377 USB HCI instead of WinRT."""
+    """ICCOA peripheral backed by direct USB HCI instead of WinRT."""
 
     def __init__(
         self,
@@ -842,7 +834,7 @@ class IccoaRawBlePeripheral:
         self._thread.start()
         started = await asyncio.to_thread(self._ready.wait, 8.0)
         if not started:
-            raise WirelessError("等待 QCA9377 原始 HCI 广播启动超时")
+            raise WirelessError("等待原始 USB HCI 广播启动超时")
         if self._startup_error is not None:
             raise WirelessError(str(self._startup_error)) from self._startup_error
 
@@ -901,7 +893,10 @@ class IccoaRawBlePeripheral:
             controller.open()
             controller.initialize()
             controller.start_iccoa_advertising(primary_data, car_name_data)
-            self.log("ICCOA 原始 BLE 广播已启动（FCFB + INFO1 + INFO2）")
+            self.log(
+                f"ICCOA 原始 BLE 广播已启动（{controller.device_name}，"
+                "FCFB + INFO1 + INFO2）"
+            )
             self._ready.set()
 
             while not self._stop.is_set():
@@ -927,7 +922,13 @@ class IccoaRawBlePeripheral:
                         self._handle_att(controller, gatt, handle, payload)
                     elif cid == LE_SIGNALING_CID:
                         self._handle_signaling(controller, handle, payload)
-        except (OSError, ValueError, RawBleError, usb.core.USBError) as exc:
+        except (
+            OSError,
+            ValueError,
+            RawBleError,
+            usb.core.USBError,
+            NotImplementedError,
+        ) as exc:
             if not self._ready.is_set():
                 self._startup_error = exc
                 self._ready.set()
@@ -938,7 +939,7 @@ class IccoaRawBlePeripheral:
                 self._ready.set()
             try:
                 controller.command(0x0C03)
-            except (OSError, RawBleError, usb.core.USBError):
+            except (OSError, RawBleError, usb.core.USBError, NotImplementedError):
                 pass
             controller.close()
 

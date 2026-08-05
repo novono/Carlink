@@ -623,6 +623,10 @@ class SessionCapture:
             self.output_dir / "windows-wlan-capabilities.txt",
             ["netsh", "wlan", "show", "wirelesscapabilities"],
         )
+        _write_command(
+            self.output_dir / "windows-wlan-drivers.txt",
+            ["netsh", "wlan", "show", "drivers"],
+        )
         if self.adb is not None:
             _write_command(
                 self.output_dir / "phone-device.txt",
@@ -823,6 +827,12 @@ def main() -> int:
         help="Windows network backend and advertised ICCOA type",
     )
     parser.add_argument("--adb", help="Path to adb.exe; auto-detected when omitted")
+    parser.add_argument(
+        "--ble-mode",
+        choices=("auto", "raw", "winrt"),
+        default="auto",
+        help="BLE backend; auto prefers supported raw USB HCI and falls back to WinRT",
+    )
     parser.add_argument("--output", type=Path, help="Session output directory")
     parser.add_argument(
         "--no-capture",
@@ -893,6 +903,7 @@ def main() -> int:
         lambda value: emit("LOG", value),
         lambda value: emit("STATE", value),
         network_mode=args.network_mode,
+        ble_mode=args.ble_mode,
     )
     controller.start()
     deadline = time.monotonic() + args.seconds
