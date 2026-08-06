@@ -192,10 +192,10 @@ public final class CarLinkService extends Service implements WirelessCarLinkEngi
     private void createNotificationChannel() {
         NotificationChannel channel = new NotificationChannel(
             CHANNEL_ID,
-            "CarLink receiver",
+            "OpenCarLink 车机助手",
             NotificationManager.IMPORTANCE_LOW
         );
-        channel.setDescription("Keeps the wireless vehicle receiver active");
+        channel.setDescription("保持无线车机助手连接");
         getSystemService(NotificationManager.class).createNotificationChannel(channel);
     }
 
@@ -215,7 +215,7 @@ public final class CarLinkService extends Service implements WirelessCarLinkEngi
         );
         return new Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle("OpenCarLink Receiver")
+            .setContentTitle("OpenCarLink 车机助手")
             .setContentText(state)
             .setContentIntent(contentIntent)
             .setOngoing(true)

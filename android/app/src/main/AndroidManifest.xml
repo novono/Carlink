@@ -22,7 +22,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="OpenCarLink Receiver"
+        android:label="OpenCarLink 车机助手"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
         <activity

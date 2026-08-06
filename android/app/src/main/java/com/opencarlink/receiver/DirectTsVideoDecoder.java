@@ -46,6 +46,7 @@ final class DirectTsVideoDecoder {
     private static final int DEFAULT_WIDTH = 1280;
     private static final int DEFAULT_HEIGHT = 720;
     private static final int INPUT_TIMEOUT_US = 2_000;
+    private static final int FIRST_KEY_FRAME_INPUT_TIMEOUT_US = 50_000;
 
     private final Surface surface;
     private final Listener listener;
@@ -53,6 +54,7 @@ final class DirectTsVideoDecoder {
     private final VideoTrackOutput videoTrack = new VideoTrackOutput();
     private volatile boolean stopped;
     private volatile boolean firstFrameReported;
+    private volatile boolean waitingForKeyFrame = true;
     private volatile MediaCodec codec;
     private volatile VideoStreamHub.Reader reader;
     private Thread extractorThread;
@@ -95,7 +97,6 @@ final class DirectTsVideoDecoder {
     private void runExtractor() {
         prioritizeCurrentThread();
         int tsFlags = DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS
-            | DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES
             | DefaultTsPayloadReaderFactory.FLAG_IGNORE_AAC_STREAM;
         Extractor extractor = new TsExtractor(
             TsExtractor.MODE_SINGLE_PMT,
@@ -205,6 +206,7 @@ final class DirectTsVideoDecoder {
                 }
                 codec = value;
             }
+            waitingForKeyFrame = true;
             listener.onDecoderReady(choice.name, choice.lowLatency);
             listener.onVideoSize(width, height);
             outputThread = new Thread(this::runOutput, "CarLink-Codec-Output");
@@ -261,8 +263,17 @@ final class DirectTsVideoDecoder {
         if (value == null || stopped) {
             return;
         }
+        boolean hasAnnexBStartCode = hasAnnexBStartCode(data, offset, size);
+        boolean keyFrame = containsH264NalType(data, offset, size, 5)
+            || (!hasAnnexBStartCode && (flags & C.BUFFER_FLAG_KEY_FRAME) != 0);
+        if (waitingForKeyFrame && !keyFrame) {
+            droppedFrames++;
+            return;
+        }
         try {
-            int inputIndex = value.dequeueInputBuffer(INPUT_TIMEOUT_US);
+            int inputIndex = value.dequeueInputBuffer(
+                waitingForKeyFrame ? FIRST_KEY_FRAME_INPUT_TIMEOUT_US : INPUT_TIMEOUT_US
+            );
             if (inputIndex < 0) {
                 droppedFrames++;
                 return;
@@ -275,16 +286,65 @@ final class DirectTsVideoDecoder {
             }
             input.clear();
             input.put(data, offset, size);
-            int codecFlags = (flags & C.BUFFER_FLAG_KEY_FRAME) != 0
+            int codecFlags = keyFrame
                 ? MediaCodec.BUFFER_FLAG_KEY_FRAME
                 : 0;
             value.queueInputBuffer(inputIndex, 0, size, Math.max(0, timeUs), codecFlags);
             queuedFrames++;
+            if (waitingForKeyFrame) {
+                waitingForKeyFrame = false;
+                Log.i(TAG, "First complete IDR queued; predictive frames are now enabled");
+            }
         } catch (IllegalStateException error) {
             if (!stopped) {
                 listener.onError("视频帧送入解码器失败：" + error.getMessage());
             }
         }
+    }
+
+    private static boolean hasAnnexBStartCode(byte[] data, int offset, int size) {
+        int end = Math.min(data.length, offset + size);
+        for (int index = Math.max(0, offset); index + 2 < end; index++) {
+            if (data[index] == 0 && data[index + 1] == 0 && data[index + 2] == 1) {
+                return true;
+            }
+            if (index + 3 < end
+                && data[index] == 0
+                && data[index + 1] == 0
+                && data[index + 2] == 0
+                && data[index + 3] == 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsH264NalType(
+        byte[] data,
+        int offset,
+        int size,
+        int expectedType
+    ) {
+        int end = Math.min(data.length, offset + size);
+        for (int index = Math.max(0, offset); index + 3 < end; index++) {
+            int headerOffset;
+            if (data[index] == 0 && data[index + 1] == 0 && data[index + 2] == 1) {
+                headerOffset = index + 3;
+            } else if (index + 4 < end
+                && data[index] == 0
+                && data[index + 1] == 0
+                && data[index + 2] == 0
+                && data[index + 3] == 1) {
+                headerOffset = index + 4;
+            } else {
+                continue;
+            }
+            if (headerOffset < end && (data[headerOffset] & 0x1f) == expectedType) {
+                return true;
+            }
+            index = headerOffset - 1;
+        }
+        return false;
     }
 
     private void runOutput() {
