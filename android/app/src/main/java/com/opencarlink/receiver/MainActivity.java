@@ -64,6 +64,7 @@ public final class MainActivity extends Activity {
     private DirectTsVideoDecoder decoder;
     private boolean firstFrameReported;
     private boolean playbackMode;
+    private float carUiScale = 3f;
     private boolean touchActive;
     private float touchDownViewX;
     private float touchDownViewY;
@@ -118,12 +119,27 @@ public final class MainActivity extends Activity {
     }
 
     private View buildContent() {
+        carUiScale = resolveCarUiScale();
+
         FrameLayout screen = new FrameLayout(this);
         screen.setBackgroundColor(Color.BLACK);
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(24), dp(14), dp(24), dp(18));
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            int leftInset = insets.getSystemWindowInsetLeft();
+            int topInset = insets.getSystemWindowInsetTop();
+            int rightInset = insets.getSystemWindowInsetRight();
+            int bottomInset = insets.getSystemWindowInsetBottom();
+            view.setPadding(
+                Math.max(dp(24), leftInset + dp(8)),
+                Math.max(dp(14), topInset + dp(8)),
+                Math.max(dp(24), rightInset + dp(8)),
+                Math.max(dp(18), bottomInset + dp(8))
+            );
+            return insets;
+        });
         root.setBackgroundColor(COLOR_BACKGROUND);
         diagnosticView = root;
 
@@ -131,88 +147,122 @@ public final class MainActivity extends Activity {
         topBar.setOrientation(LinearLayout.HORIZONTAL);
         topBar.setGravity(Gravity.CENTER_VERTICAL);
 
-        View brandBar = new View(this);
-        brandBar.setBackground(roundedBackground(COLOR_GREEN, 3));
-        LinearLayout.LayoutParams brandBarParams = new LinearLayout.LayoutParams(dp(5), dp(36));
-        brandBarParams.rightMargin = dp(12);
-        topBar.addView(brandBar, brandBarParams);
+        TextView brandIcon = label("车", 18, Color.rgb(7, 24, 15));
+        brandIcon.setGravity(Gravity.CENTER);
+        brandIcon.setTypeface(null, android.graphics.Typeface.BOLD);
+        brandIcon.setBackground(roundedBackground(COLOR_GREEN, 12));
+        LinearLayout.LayoutParams brandIconParams = new LinearLayout.LayoutParams(dp(46), dp(46));
+        brandIconParams.rightMargin = dp(14);
+        topBar.addView(brandIcon, brandIconParams);
 
         LinearLayout brand = new LinearLayout(this);
         brand.setOrientation(LinearLayout.VERTICAL);
-        TextView title = label("OpenCarLink", 24, COLOR_TEXT);
+        TextView title = label("CarLink 车机管家", 23, COLOR_TEXT);
         title.setTypeface(null, android.graphics.Typeface.BOLD);
         brand.addView(title, matchWrap());
-        TextView product = label("无线车机助手", 12, COLOR_MUTED);
-        brand.addView(product, matchWrap());
+        TextView product = label("手机互联 · 行车服务", 11, COLOR_MUTED);
+        LinearLayout.LayoutParams productParams = matchWrap();
+        productParams.topMargin = dp(2);
+        brand.addView(product, productParams);
         topBar.addView(brand, new LinearLayout.LayoutParams(0, -2, 1f));
 
         TextClock clock = new TextClock(this);
         clock.setFormat12Hour("HH:mm");
         clock.setFormat24Hour("HH:mm");
         clock.setTextColor(COLOR_TEXT);
-        clock.setTextSize(26);
+        clock.setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(30));
         clock.setTypeface(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD);
         topBar.addView(clock, new LinearLayout.LayoutParams(-2, -2));
 
         LinearLayout buildInfo = new LinearLayout(this);
         buildInfo.setOrientation(LinearLayout.VERTICAL);
-        buildInfo.setGravity(Gravity.END);
-        TextView device = label(Build.MANUFACTURER + " " + Build.MODEL, 12, COLOR_MUTED);
+        buildInfo.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        TextView device = label(Build.MANUFACTURER + " " + Build.MODEL, 11, COLOR_MUTED);
         device.setGravity(Gravity.END);
         buildInfo.addView(device, matchWrap());
-        TextView version = label("v" + versionName(), 11, COLOR_BLUE);
+        TextView version = label("v" + versionName(), 10, COLOR_BLUE);
         version.setGravity(Gravity.END);
-        buildInfo.addView(version, matchWrap());
-        LinearLayout.LayoutParams buildInfoParams = new LinearLayout.LayoutParams(dp(170), -2);
-        buildInfoParams.leftMargin = dp(18);
+        LinearLayout.LayoutParams versionParams = matchWrap();
+        versionParams.topMargin = dp(2);
+        buildInfo.addView(version, versionParams);
+        LinearLayout.LayoutParams buildInfoParams = new LinearLayout.LayoutParams(dp(174), -1);
+        buildInfoParams.leftMargin = dp(20);
         topBar.addView(buildInfo, buildInfoParams);
-        root.addView(topBar, new LinearLayout.LayoutParams(-1, dp(52)));
+        root.addView(topBar, new LinearLayout.LayoutParams(-1, dp(58)));
 
         View topDivider = new View(this);
         topDivider.setBackgroundColor(COLOR_DIVIDER);
         LinearLayout.LayoutParams topDividerParams = new LinearLayout.LayoutParams(-1, dp(1));
-        topDividerParams.topMargin = dp(10);
+        topDividerParams.topMargin = dp(8);
         root.addView(topDivider, topDividerParams);
 
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams contentParams = new LinearLayout.LayoutParams(-1, 0, 1f);
+        contentParams.topMargin = dp(14);
+        root.addView(content, contentParams);
 
         LinearLayout connection = new LinearLayout(this);
         connection.setOrientation(LinearLayout.VERTICAL);
-        connection.setPadding(0, dp(20), dp(28), 0);
+        connection.setPadding(dp(24), dp(20), dp(24), dp(20));
+        connection.setBackground(roundedBackground(COLOR_SURFACE, 12));
 
-        LinearLayout statusRow = new LinearLayout(this);
-        statusRow.setOrientation(LinearLayout.HORIZONTAL);
-        statusRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout featureHeader = new LinearLayout(this);
+        featureHeader.setOrientation(LinearLayout.HORIZONTAL);
+        featureHeader.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView featureIcon = label("互", 17, Color.rgb(7, 24, 15));
+        featureIcon.setGravity(Gravity.CENTER);
+        featureIcon.setTypeface(null, android.graphics.Typeface.BOLD);
+        featureIcon.setBackground(roundedBackground(COLOR_GREEN, 10));
+        LinearLayout.LayoutParams featureIconParams = new LinearLayout.LayoutParams(dp(42), dp(42));
+        featureIconParams.rightMargin = dp(12);
+        featureHeader.addView(featureIcon, featureIconParams);
+
+        LinearLayout featureName = new LinearLayout(this);
+        featureName.setOrientation(LinearLayout.VERTICAL);
+        TextView featureTitle = label("手机互联", 19, COLOR_TEXT);
+        featureTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+        featureName.addView(featureTitle, matchWrap());
+        TextView featureSubtitle = label("无线投屏 · 触控回传", 10, COLOR_MUTED);
+        featureName.addView(featureSubtitle, matchWrap());
+        featureHeader.addView(featureName, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        LinearLayout statusPill = new LinearLayout(this);
+        statusPill.setOrientation(LinearLayout.HORIZONTAL);
+        statusPill.setGravity(Gravity.CENTER_VERTICAL);
+        statusPill.setPadding(dp(11), dp(7), dp(11), dp(7));
+        statusPill.setBackground(roundedBackground(COLOR_SURFACE_STRONG, 10));
         statusDot = new View(this);
         statusDot.setBackground(roundedBackground(COLOR_MUTED, 8));
-        LinearLayout.LayoutParams dotParams = new LinearLayout.LayoutParams(dp(10), dp(10));
-        dotParams.rightMargin = dp(8);
-        statusRow.addView(statusDot, dotParams);
-        statusModeText = label("待机", 12, COLOR_MUTED);
+        LinearLayout.LayoutParams dotParams = new LinearLayout.LayoutParams(dp(8), dp(8));
+        dotParams.rightMargin = dp(7);
+        statusPill.addView(statusDot, dotParams);
+        statusModeText = label("待机", 11, COLOR_MUTED);
         statusModeText.setTypeface(null, android.graphics.Typeface.BOLD);
-        statusRow.addView(statusModeText, new LinearLayout.LayoutParams(-2, -2));
-        connection.addView(statusRow, matchWrap());
+        statusPill.addView(statusModeText, new LinearLayout.LayoutParams(-2, -2));
+        featureHeader.addView(statusPill, new LinearLayout.LayoutParams(-2, -2));
+        connection.addView(featureHeader, matchWrap());
 
-        stateText = label("等待连接", 31, COLOR_TEXT);
+        stateText = label("等待连接", 34, COLOR_TEXT);
         stateText.setTypeface(null, android.graphics.Typeface.BOLD);
         stateText.setSingleLine(true);
         stateText.setEllipsize(TextUtils.TruncateAt.END);
         stateText.setAutoSizeTextTypeUniformWithConfiguration(
-            21,
-            31,
-            1,
-            TypedValue.COMPLEX_UNIT_SP
+            dp(24),
+            dp(34),
+            dp(1),
+            TypedValue.COMPLEX_UNIT_PX
         );
         LinearLayout.LayoutParams stateParams = matchWrap();
-        stateParams.topMargin = dp(8);
+        stateParams.topMargin = dp(20);
         connection.addView(stateText, stateParams);
 
         detailText = label("无线接收端未运行", 14, COLOR_MUTED);
         detailText.setMaxLines(2);
         detailText.setEllipsize(TextUtils.TruncateAt.END);
         LinearLayout.LayoutParams detailParams = matchWrap();
-        detailParams.topMargin = dp(4);
+        detailParams.topMargin = dp(5);
         connection.addView(detailText, detailParams);
 
         View connectionSpacer = new View(this);
@@ -221,89 +271,92 @@ public final class MainActivity extends Activity {
         LinearLayout pairing = new LinearLayout(this);
         pairing.setOrientation(LinearLayout.HORIZONTAL);
         pairing.setGravity(Gravity.CENTER_VERTICAL);
-        pairing.setPadding(dp(18), dp(11), dp(18), dp(11));
-        pairing.setBackground(outlinedBackground(COLOR_SURFACE, COLOR_DIVIDER, 8));
+        pairing.setPadding(dp(18), dp(12), dp(18), dp(12));
+        pairing.setBackground(outlinedBackground(COLOR_SURFACE_STRONG, COLOR_DIVIDER, 10));
         LinearLayout pairingLabel = new LinearLayout(this);
         pairingLabel.setOrientation(LinearLayout.VERTICAL);
-        TextView pairingTitle = label("配对码", 13, COLOR_TEXT);
+        TextView pairingTitle = label("手机配对码", 13, COLOR_TEXT);
         pairingTitle.setTypeface(null, android.graphics.Typeface.BOLD);
         pairingLabel.addView(pairingTitle, matchWrap());
-        TextView pairingType = label("PIN", 10, COLOR_MUTED);
+        TextView pairingType = label("连接时在手机端输入", 10, COLOR_MUTED);
         pairingLabel.addView(pairingType, matchWrap());
         pairing.addView(pairingLabel, new LinearLayout.LayoutParams(0, -2, 1f));
         pinText = label("------", 31, COLOR_AMBER);
         pinText.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         pinText.setTypeface(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD);
         pairing.addView(pinText, new LinearLayout.LayoutParams(-2, -2));
-        connection.addView(pairing, new LinearLayout.LayoutParams(-1, dp(68)));
+        connection.addView(pairing, new LinearLayout.LayoutParams(-1, dp(76)));
 
         LinearLayout controls = new LinearLayout(this);
         controls.setOrientation(LinearLayout.HORIZONTAL);
         startButton = commandButton("开始连接", COLOR_GREEN, Color.rgb(7, 24, 15));
         startButton.setOnClickListener(view -> requestAndStart());
-        controls.addView(startButton, new LinearLayout.LayoutParams(0, dp(52), 1f));
-        stopButton = commandButton("停止", COLOR_SURFACE_STRONG, COLOR_TEXT);
-        stopButton.setBackground(outlinedBackground(COLOR_SURFACE_STRONG, COLOR_DIVIDER, 7));
+        controls.addView(startButton, new LinearLayout.LayoutParams(0, dp(58), 1f));
+        stopButton = commandButton("停止服务", COLOR_SURFACE_STRONG, COLOR_TEXT);
+        stopButton.setBackground(outlinedBackground(COLOR_SURFACE_STRONG, COLOR_DIVIDER, 9));
         stopButton.setOnClickListener(view -> stopReceiver());
-        LinearLayout.LayoutParams stopParams = new LinearLayout.LayoutParams(dp(108), dp(52));
-        stopParams.leftMargin = dp(10);
+        LinearLayout.LayoutParams stopParams = new LinearLayout.LayoutParams(dp(120), dp(58));
+        stopParams.leftMargin = dp(12);
         controls.addView(stopButton, stopParams);
-        LinearLayout.LayoutParams controlsParams = new LinearLayout.LayoutParams(-1, dp(52));
+        LinearLayout.LayoutParams controlsParams = new LinearLayout.LayoutParams(-1, dp(58));
         controlsParams.topMargin = dp(12);
         connection.addView(controls, controlsParams);
 
-        content.addView(connection, new LinearLayout.LayoutParams(0, -1, 1.08f));
-
-        View columnDivider = new View(this);
-        columnDivider.setBackgroundColor(COLOR_DIVIDER);
-        LinearLayout.LayoutParams columnDividerParams = new LinearLayout.LayoutParams(dp(1), -1);
-        columnDividerParams.topMargin = dp(20);
-        content.addView(columnDivider, columnDividerParams);
+        LinearLayout.LayoutParams connectionParams = new LinearLayout.LayoutParams(0, -1, 1.22f);
+        connectionParams.rightMargin = dp(14);
+        content.addView(connection, connectionParams);
 
         LinearLayout activity = new LinearLayout(this);
         activity.setOrientation(LinearLayout.VERTICAL);
-        activity.setPadding(dp(28), dp(20), 0, 0);
-        TextView progressTitle = label("连接进度", 15, COLOR_TEXT);
+        activity.setPadding(dp(20), dp(18), dp(20), dp(18));
+        activity.setBackground(roundedBackground(COLOR_SURFACE, 12));
+
+        TextView progressTitle = label("连接向导", 17, COLOR_TEXT);
         progressTitle.setTypeface(null, android.graphics.Typeface.BOLD);
         activity.addView(progressTitle, matchWrap());
+        TextView progressHint = label("自动完成无线握手与安全认证", 10, COLOR_MUTED);
+        LinearLayout.LayoutParams progressHintParams = matchWrap();
+        progressHintParams.topMargin = dp(2);
+        activity.addView(progressHint, progressHintParams);
 
         LinearLayout stages = new LinearLayout(this);
         stages.setOrientation(LinearLayout.HORIZONTAL);
         String[] names = {"网络", "蓝牙", "手机", "认证"};
         for (int index = 0; index < names.length; index++) {
-            TextView stage = label((index + 1) + "\n" + names[index], 12, COLOR_MUTED);
+            TextView stage = label(String.format("%02d\n%s", index + 1, names[index]), 12, COLOR_MUTED);
             stage.setGravity(Gravity.CENTER);
-            stage.setLineSpacing(0f, 0.92f);
-            stage.setBackground(outlinedBackground(COLOR_SURFACE, COLOR_DIVIDER, 7));
-            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(58), 1f);
+            stage.setLineSpacing(0f, 0.94f);
+            stage.setTypeface(null, android.graphics.Typeface.BOLD);
+            stage.setBackground(outlinedBackground(COLOR_SURFACE_STRONG, COLOR_DIVIDER, 9));
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(70), 1f);
             if (index > 0) {
                 params.leftMargin = dp(7);
             }
             stages.addView(stage, params);
             stageViews[index] = stage;
         }
-        LinearLayout.LayoutParams stagesParams = new LinearLayout.LayoutParams(-1, dp(58));
-        stagesParams.topMargin = dp(10);
+        LinearLayout.LayoutParams stagesParams = new LinearLayout.LayoutParams(-1, dp(70));
+        stagesParams.topMargin = dp(12);
         activity.addView(stages, stagesParams);
 
-        TextView logTitle = label("连接记录", 13, COLOR_MUTED);
+        TextView logTitle = label("最近连接", 14, COLOR_TEXT);
         logTitle.setTypeface(null, android.graphics.Typeface.BOLD);
         LinearLayout.LayoutParams logTitleParams = matchWrap();
-        logTitleParams.topMargin = dp(16);
-        logTitleParams.bottomMargin = dp(7);
+        logTitleParams.topMargin = dp(18);
+        logTitleParams.bottomMargin = dp(8);
         activity.addView(logTitle, logTitleParams);
 
         logScroll = new ScrollView(this);
         logScroll.setFillViewport(true);
-        logScroll.setBackground(outlinedBackground(Color.rgb(15, 18, 17), COLOR_DIVIDER, 7));
-        logText = label("尚无连接记录", 11, Color.rgb(190, 200, 195));
+        logScroll.setBackground(outlinedBackground(Color.rgb(15, 18, 17), COLOR_DIVIDER, 9));
+        logText = label("尚无连接记录\n\n启动手机互联后，连接状态会显示在这里。", 11, Color.rgb(190, 200, 195));
         logText.setTypeface(android.graphics.Typeface.MONOSPACE);
-        logText.setPadding(dp(12), dp(10), dp(12), dp(10));
+        logText.setLineSpacing(dp(2), 1f);
+        logText.setPadding(dp(14), dp(12), dp(14), dp(12));
         logScroll.addView(logText, new ScrollView.LayoutParams(-1, -2));
         activity.addView(logScroll, new LinearLayout.LayoutParams(-1, 0, 1f));
 
-        content.addView(activity, new LinearLayout.LayoutParams(0, -1, 0.92f));
-        root.addView(content, new LinearLayout.LayoutParams(-1, 0, 1f));
+        content.addView(activity, new LinearLayout.LayoutParams(0, -1, 0.88f));
 
         FrameLayout playback = new FrameLayout(this);
         playback.setBackgroundColor(Color.BLACK);
@@ -353,26 +406,22 @@ public final class MainActivity extends Activity {
         });
         playback.addView(videoHost, new FrameLayout.LayoutParams(-1, -1));
 
-        Button playbackStop = new Button(this);
-        playbackStop.setText("结束投屏");
-        playbackStop.setTextColor(Color.WHITE);
-        playbackStop.setTextSize(13);
-        playbackStop.setAllCaps(false);
-        playbackStop.setBackground(roundedBackground(Color.argb(210, 20, 24, 22), 7));
+        Button playbackStop = commandButton("结束投屏", Color.argb(220, 20, 24, 22), Color.WHITE);
+        playbackStop.setBackground(outlinedBackground(Color.argb(220, 20, 24, 22), Color.argb(120, 255, 255, 255), 10));
         playbackStop.setOnClickListener(view -> stopReceiver());
-        FrameLayout.LayoutParams playbackStopParams = new FrameLayout.LayoutParams(dp(106), dp(44));
+        FrameLayout.LayoutParams playbackStopParams = new FrameLayout.LayoutParams(dp(128), dp(50));
         playbackStopParams.gravity = Gravity.TOP | Gravity.END;
-        playbackStopParams.topMargin = dp(14);
-        playbackStopParams.rightMargin = dp(14);
+        playbackStopParams.topMargin = dp(16);
+        playbackStopParams.rightMargin = dp(16);
         playback.addView(playbackStop, playbackStopParams);
 
         TextView playbackVersion = label("v" + versionName(), 11, Color.LTGRAY);
-        playbackVersion.setPadding(dp(7), dp(3), dp(7), dp(3));
-        playbackVersion.setBackground(roundedBackground(Color.argb(170, 20, 24, 22), 5));
+        playbackVersion.setPadding(dp(8), dp(4), dp(8), dp(4));
+        playbackVersion.setBackground(roundedBackground(Color.argb(185, 20, 24, 22), 6));
         FrameLayout.LayoutParams playbackVersionParams = new FrameLayout.LayoutParams(-2, -2);
         playbackVersionParams.gravity = Gravity.TOP | Gravity.END;
-        playbackVersionParams.topMargin = dp(64);
-        playbackVersionParams.rightMargin = dp(14);
+        playbackVersionParams.topMargin = dp(72);
+        playbackVersionParams.rightMargin = dp(16);
         playback.addView(playbackVersion, playbackVersionParams);
 
         screen.addView(root, new FrameLayout.LayoutParams(-1, -1));
@@ -608,6 +657,7 @@ public final class MainActivity extends Activity {
         }
         firstFrameReported = false;
         DirectTsVideoDecoder value = new DirectTsVideoDecoder(
+            this,
             videoView.getHolder().getSurface(),
             new DirectTsVideoDecoder.Listener() {
             @Override
@@ -668,7 +718,7 @@ public final class MainActivity extends Activity {
     private TextView label(String value, int sp, int color) {
         TextView view = new TextView(this);
         view.setText(value);
-        view.setTextSize(sp);
+        view.setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(sp));
         view.setTextColor(color);
         view.setLetterSpacing(0f);
         return view;
@@ -677,7 +727,7 @@ public final class MainActivity extends Activity {
     private Button commandButton(String text, int backgroundColor, int textColor) {
         Button button = new Button(this);
         button.setText(text);
-        button.setTextSize(15);
+        button.setTextSize(TypedValue.COMPLEX_UNIT_PX, dp(16));
         button.setTextColor(textColor);
         button.setTypeface(null, android.graphics.Typeface.BOLD);
         button.setAllCaps(false);
@@ -686,7 +736,7 @@ public final class MainActivity extends Activity {
         button.setMinWidth(0);
         button.setPadding(dp(10), 0, dp(10), 0);
         button.setStateListAnimator(null);
-        button.setBackground(roundedBackground(backgroundColor, 7));
+        button.setBackground(roundedBackground(backgroundColor, 9));
         return button;
     }
 
@@ -699,7 +749,7 @@ public final class MainActivity extends Activity {
 
     private GradientDrawable outlinedBackground(int color, int strokeColor, int radiusDp) {
         GradientDrawable drawable = roundedBackground(color, radiusDp);
-        drawable.setStroke(dp(1), strokeColor);
+        drawable.setStroke(Math.max(1, dp(1)), strokeColor);
         return drawable;
     }
 
@@ -707,7 +757,16 @@ public final class MainActivity extends Activity {
         return new LinearLayout.LayoutParams(-1, -2);
     }
 
+    private float resolveCarUiScale() {
+        int width = getResources().getDisplayMetrics().widthPixels;
+        int height = getResources().getDisplayMetrics().heightPixels;
+        int longSide = Math.max(width, height);
+        int shortSide = Math.min(width, height);
+        float viewportScale = Math.min(longSide / 2560f, shortSide / 1440f);
+        return Math.max(0.75f, viewportScale * 3f);
+    }
+
     private int dp(int value) {
-        return Math.round(value * getResources().getDisplayMetrics().density);
+        return Math.round(value * carUiScale);
     }
 }
