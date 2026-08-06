@@ -93,6 +93,7 @@ final class DirectTsVideoDecoder {
     }
 
     private void runExtractor() {
+        prioritizeCurrentThread();
         int tsFlags = DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS
             | DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES
             | DefaultTsPayloadReaderFactory.FLAG_IGNORE_AAC_STREAM;
@@ -287,6 +288,7 @@ final class DirectTsVideoDecoder {
     }
 
     private void runOutput() {
+        prioritizeCurrentThread();
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         while (!stopped) {
             MediaCodec value = codec;
@@ -345,6 +347,13 @@ final class DirectTsVideoDecoder {
             } catch (IllegalStateException ignored) {
             }
             value.release();
+        }
+    }
+
+    private static void prioritizeCurrentThread() {
+        try {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY);
+        } catch (IllegalArgumentException | SecurityException ignored) {
         }
     }
 

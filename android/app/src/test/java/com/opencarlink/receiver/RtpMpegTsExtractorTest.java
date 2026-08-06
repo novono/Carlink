@@ -35,6 +35,29 @@ public final class RtpMpegTsExtractorTest {
         );
     }
 
+    @Test
+    public void extractsPayloadWithCsrcExtensionAndPaddingWithoutPacketCopies() {
+        byte[] transport = new byte[188];
+        transport[0] = 0x47;
+        byte[] packet = new byte[2 + 12 + 4 + 8 + transport.length + 4];
+        int packetLength = packet.length - 2;
+        packet[0] = (byte) (packetLength >> 8);
+        packet[1] = (byte) packetLength;
+        packet[2] = (byte) 0xb1;
+        packet[3] = 33;
+        int extension = 2 + 12 + 4;
+        packet[extension + 2] = 0;
+        packet[extension + 3] = 1;
+        int payload = extension + 8;
+        System.arraycopy(transport, 0, packet, payload, transport.length);
+        packet[packet.length - 1] = 4;
+
+        RtpMpegTsExtractor extractor = new RtpMpegTsExtractor();
+
+        assertArrayEquals(transport, extractor.feed(packet, packet.length));
+        assertEquals(1, extractor.packetCount());
+    }
+
     private static byte[] framedRtp(int payloadType, byte[] payload) {
         byte[] result = new byte[2 + 12 + payload.length];
         int packetLength = result.length - 2;

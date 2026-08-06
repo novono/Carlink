@@ -19,6 +19,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.net.wifi.WifiManager;
 import android.net.wifi.p2p.WifiP2pConfig;
 import android.net.wifi.p2p.WifiP2pGroup;
 import android.net.wifi.p2p.WifiP2pManager;
@@ -74,6 +75,7 @@ final class WirelessCarLinkEngine {
 
     private WifiP2pManager wifiManager;
     private WifiP2pManager.Channel wifiChannel;
+    private WifiManager.WifiLock wifiLock;
     private BroadcastReceiver wifiReceiver;
     private WifiP2pGroup group;
     private String ssid = "";
@@ -98,6 +100,7 @@ final class WirelessCarLinkEngine {
     void start() {
         callback.onLog("创建 Wi-Fi Direct autonomous GO");
         try {
+            acquireLowLatencyWifiLock();
             wifiManager = (WifiP2pManager) context.getSystemService(Context.WIFI_P2P_SERVICE);
             if (wifiManager == null) {
                 fail("系统没有 Wi-Fi Direct 服务");
@@ -121,6 +124,7 @@ final class WirelessCarLinkEngine {
         stopped = true;
         stopBluetooth();
         closeAuthListener();
+        releaseLowLatencyWifiLock();
         WirelessSessionChannels channels = sessionChannels;
         sessionChannels = null;
         if (channels != null) {
@@ -142,6 +146,37 @@ final class WirelessCarLinkEngine {
             }
         }
         callback.onLog("无线资源已释放");
+    }
+
+    private void acquireLowLatencyWifiLock() {
+        WifiManager manager = (WifiManager) context.getSystemService(Context.WIFI_SERVICE);
+        if (manager == null) {
+            callback.onLog("Wi-Fi 低延迟模式不可用");
+            return;
+        }
+        try {
+            WifiManager.WifiLock lock = manager.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+                "OpenCarLink:LowLatency"
+            );
+            lock.setReferenceCounted(false);
+            lock.acquire();
+            wifiLock = lock;
+            callback.onLog("Wi-Fi 低延迟模式已启用");
+        } catch (RuntimeException error) {
+            callback.onLog("Wi-Fi 低延迟模式启用失败：" + error.getMessage());
+        }
+    }
+
+    private void releaseLowLatencyWifiLock() {
+        WifiManager.WifiLock lock = wifiLock;
+        wifiLock = null;
+        if (lock != null && lock.isHeld()) {
+            try {
+                lock.release();
+            } catch (RuntimeException ignored) {
+            }
+        }
     }
 
     private void registerWifiReceiver() {

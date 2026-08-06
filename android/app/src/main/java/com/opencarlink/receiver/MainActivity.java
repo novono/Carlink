@@ -35,7 +35,6 @@ import java.util.List;
 @SuppressLint("UnsafeOptInUsageError")
 public final class MainActivity extends Activity {
     private static final int PERMISSION_REQUEST = 41;
-    private static final long TOUCH_MOVE_INTERVAL_MS = 16L;
 
     private TextView stateText;
     private TextView detailText;
@@ -50,11 +49,13 @@ public final class MainActivity extends Activity {
     private boolean firstFrameReported;
     private boolean playbackMode;
     private boolean touchActive;
-    private long lastTouchMoveMs;
     private float touchDownViewX;
     private float touchDownViewY;
+    private int touchDownUibcX;
+    private int touchDownUibcY;
     private long touchDownEventMs;
     private int touchMoveCount;
+    private int touchMaxPointerCount;
     private final TextView[] stageViews = new TextView[4];
 
     private final BroadcastReceiver updates = new BroadcastReceiver() {
@@ -120,7 +121,11 @@ public final class MainActivity extends Activity {
         title.setTypeface(null, android.graphics.Typeface.BOLD);
         root.addView(title, matchWrap());
 
-        TextView device = label(Build.MANUFACTURER + " " + Build.MODEL, 13, muted);
+        TextView device = label(
+            Build.MANUFACTURER + " " + Build.MODEL + "  |  v" + versionName(),
+            13,
+            muted
+        );
         LinearLayout.LayoutParams deviceParams = matchWrap();
         deviceParams.bottomMargin = dp(22);
         root.addView(device, deviceParams);
@@ -200,8 +205,8 @@ public final class MainActivity extends Activity {
 
         FrameLayout videoHost = new FrameLayout(this);
         videoHost.setBackgroundColor(Color.BLACK);
-        videoHost.setOnTouchListener(this::handleVideoTouch);
         videoView = new SurfaceView(this);
+        videoView.setOnTouchListener(this::handleVideoTouch);
         videoHost.addView(videoView, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
         videoHost.addOnLayoutChangeListener((view, left, top, right, bottom,
                                               oldLeft, oldTop, oldRight, oldBottom) -> {
@@ -253,6 +258,15 @@ public final class MainActivity extends Activity {
         playbackStopParams.rightMargin = dp(14);
         playback.addView(playbackStop, playbackStopParams);
 
+        TextView playbackVersion = label("v" + versionName(), 11, Color.LTGRAY);
+        playbackVersion.setPadding(dp(7), dp(3), dp(7), dp(3));
+        playbackVersion.setBackgroundColor(Color.argb(150, 20, 24, 22));
+        FrameLayout.LayoutParams playbackVersionParams = new FrameLayout.LayoutParams(-2, -2);
+        playbackVersionParams.gravity = Gravity.TOP | Gravity.END;
+        playbackVersionParams.topMargin = dp(64);
+        playbackVersionParams.rightMargin = dp(14);
+        playback.addView(playbackVersion, playbackVersionParams);
+
         screen.addView(root, new FrameLayout.LayoutParams(-1, -1));
         screen.addView(playback, new FrameLayout.LayoutParams(-1, -1));
         return screen;
@@ -261,14 +275,16 @@ public final class MainActivity extends Activity {
     private boolean handleVideoTouch(View view, MotionEvent event) {
         int maskedAction = event.getActionMasked();
         if (maskedAction == MotionEvent.ACTION_DOWN) {
-            int[][] pointers = mapVideoPointers(view, event, false);
+            int[][] pointers = mapVideoPointers(view, event);
             touchActive = pointers != null && sendTouchEvent(event.getAction(), pointers);
             if (touchActive) {
                 touchDownViewX = event.getX();
                 touchDownViewY = event.getY();
+                touchDownUibcX = pointers[1][0];
+                touchDownUibcY = pointers[2][0];
                 touchDownEventMs = event.getEventTime();
                 touchMoveCount = 0;
-                lastTouchMoveMs = android.os.SystemClock.elapsedRealtime();
+                touchMaxPointerCount = pointers[0].length;
             }
             return touchActive;
         }
@@ -276,25 +292,29 @@ public final class MainActivity extends Activity {
             return false;
         }
         if (maskedAction == MotionEvent.ACTION_MOVE) {
-            long now = android.os.SystemClock.elapsedRealtime();
-            if (now - lastTouchMoveMs >= TOUCH_MOVE_INTERVAL_MS) {
-                lastTouchMoveMs = now;
-                sendTouchEvent(event.getAction(), mapVideoPointers(view, event, true));
-                touchMoveCount++;
-            }
+            int[][] pointers = mapVideoPointers(view, event);
+            touchMaxPointerCount = Math.max(touchMaxPointerCount, pointers[0].length);
+            sendTouchEvent(event.getAction(), pointers);
+            touchMoveCount++;
             return true;
         }
         if (maskedAction == MotionEvent.ACTION_POINTER_DOWN
             || maskedAction == MotionEvent.ACTION_POINTER_UP) {
-            sendTouchEvent(event.getAction(), mapVideoPointers(view, event, true));
+            int[][] pointers = mapVideoPointers(view, event);
+            touchMaxPointerCount = Math.max(touchMaxPointerCount, pointers[0].length);
+            sendTouchEvent(event.getAction(), pointers);
             return true;
         }
         if (maskedAction == MotionEvent.ACTION_UP || maskedAction == MotionEvent.ACTION_CANCEL) {
-            int action = maskedAction == MotionEvent.ACTION_CANCEL
-                ? UibcProtocol.ACTION_UP : event.getAction();
-            sendTouchEvent(action, mapVideoPointers(view, event, true));
+            int[][] pointers = mapVideoPointers(view, event);
+            int deltaX = pointers[1][0] - touchDownUibcX;
+            int deltaY = pointers[2][0] - touchDownUibcY;
+            sendTouchEvent(event.getAction(), pointers);
+            if (maskedAction == MotionEvent.ACTION_UP) {
+                view.performClick();
+            }
             touchActive = false;
-            logTouchGesture(event);
+            logTouchGesture(event, deltaX, deltaY);
             return true;
         }
         return true;
@@ -304,36 +324,36 @@ public final class MainActivity extends Activity {
         return TouchInputHub.sendTouch(action, pointers[0], pointers[1], pointers[2]);
     }
 
-    private void logTouchGesture(MotionEvent event) {
+    private void logTouchGesture(
+        MotionEvent event,
+        int uibcDeltaX,
+        int uibcDeltaY
+    ) {
         Log.i(
             "OpenCarLinkTouch",
             "viewDelta=" + Math.round(event.getX() - touchDownViewX)
                 + "," + Math.round(event.getY() - touchDownViewY)
+                + " uibcDelta=" + uibcDeltaX + "," + uibcDeltaY
                 + " duration=" + (event.getEventTime() - touchDownEventMs) + "ms"
                 + " moves=" + touchMoveCount
+                + " pointers=" + touchMaxPointerCount
         );
     }
 
-    private int[][] mapVideoPointers(View view, MotionEvent event, boolean clamp) {
-        float scale = Math.min(
-            view.getWidth() / (float) UibcProtocol.WIDTH,
-            view.getHeight() / (float) UibcProtocol.HEIGHT
-        );
-        float left = (view.getWidth() - UibcProtocol.WIDTH * scale) / 2f;
-        float top = (view.getHeight() - UibcProtocol.HEIGHT * scale) / 2f;
+    private int[][] mapVideoPointers(View view, MotionEvent event) {
+        int viewWidth = view.getWidth();
+        int viewHeight = view.getHeight();
+        if (viewWidth <= 0 || viewHeight <= 0) {
+            return null;
+        }
         int count = event.getPointerCount();
         int[] ids = new int[count];
         int[] xs = new int[count];
         int[] ys = new int[count];
         for (int index = 0; index < count; index++) {
-            float x = (event.getX(index) - left) / scale;
-            float y = (event.getY(index) - top) / scale;
-            if (!clamp && (x < 0 || y < 0 || x >= UibcProtocol.WIDTH || y >= UibcProtocol.HEIGHT)) {
-                return null;
-            }
             ids[index] = event.getPointerId(index);
-            xs[index] = Math.max(0, Math.min(UibcProtocol.WIDTH - 1, (int) x));
-            ys[index] = Math.max(0, Math.min(UibcProtocol.HEIGHT - 1, (int) y));
+            xs[index] = (int) (event.getX(index) * UibcProtocol.WIDTH / viewWidth);
+            ys[index] = (int) (event.getY(index) * UibcProtocol.HEIGHT / viewHeight);
         }
         return new int[][]{ids, xs, ys};
     }
@@ -512,6 +532,14 @@ public final class MainActivity extends Activity {
                 .setAction(CarLinkService.ACTION_VIDEO_STATUS)
                 .putExtra(CarLinkService.EXTRA_VIDEO_STATUS, message)
         );
+    }
+
+    private String versionName() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (PackageManager.NameNotFoundException error) {
+            return "unknown";
+        }
     }
 
     private TextView label(String value, int sp, int color) {

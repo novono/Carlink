@@ -117,19 +117,14 @@ final class WirelessSessionChannels {
         }
     }
 
-    private boolean sendUibc(byte[] payload, boolean replaceable) {
+    private boolean sendUibc(byte[] payload) {
         Socket connection = uibcSocket;
         if (stopped || connection == null || connection.isClosed()) {
             return false;
         }
         synchronized (uibcQueueLock) {
-            UibcWrite last = uibcQueue.peekLast();
-            if (replaceable && last != null && last.replaceable) {
-                uibcQueue.removeLast();
-            }
             uibcQueue.addLast(new UibcWrite(
                 payload.clone(),
-                replaceable,
                 SystemClock.elapsedRealtime()
             ));
             uibcQueueLock.notifyAll();
@@ -138,6 +133,7 @@ final class WirelessSessionChannels {
     }
 
     private void runUibcWriter() {
+        prioritizeCurrentThread();
         while (!stopped) {
             UibcWrite write;
             synchronized (uibcQueueLock) {
@@ -153,10 +149,10 @@ final class WirelessSessionChannels {
             }
             if (write != null) {
                 long waitMs = SystemClock.elapsedRealtime() - write.enqueuedAtMs;
-                if (!write.replaceable || waitMs >= 10L) {
+                if (waitMs >= 10L) {
                     Log.i(
                         "OpenCarLinkLatency",
-                        "uibc replaceable=" + write.replaceable + " queueWait=" + waitMs + "ms"
+                        "uibc queueWait=" + waitMs + "ms"
                     );
                 }
                 writeUibc(write.payload);
@@ -179,12 +175,10 @@ final class WirelessSessionChannels {
 
     private static final class UibcWrite {
         final byte[] payload;
-        final boolean replaceable;
         final long enqueuedAtMs;
 
-        UibcWrite(byte[] payload, boolean replaceable, long enqueuedAtMs) {
+        UibcWrite(byte[] payload, long enqueuedAtMs) {
             this.payload = payload;
-            this.replaceable = replaceable;
             this.enqueuedAtMs = enqueuedAtMs;
         }
     }
@@ -290,6 +284,7 @@ final class WirelessSessionChannels {
     }
 
     private void runRtp(CountDownLatch ready) {
+        prioritizeCurrentThread();
         ServerSocket listener = null;
         Socket connection = null;
         try {
@@ -439,6 +434,13 @@ final class WirelessSessionChannels {
         try {
             socket.close();
         } catch (IOException ignored) {
+        }
+    }
+
+    private static void prioritizeCurrentThread() {
+        try {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY);
+        } catch (IllegalArgumentException | SecurityException ignored) {
         }
     }
 }

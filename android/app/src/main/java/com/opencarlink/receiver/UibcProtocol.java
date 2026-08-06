@@ -6,6 +6,7 @@ final class UibcProtocol {
     static final int ACTION_DOWN = 0;
     static final int ACTION_UP = 1;
     static final int ACTION_MOVE = 2;
+    static final int ACTION_CANCEL = 3;
     static final int ACTION_POINTER_DOWN = 5;
     static final int ACTION_POINTER_UP = 6;
     static final int KEY_ACTION_PRESS = 2;
@@ -23,6 +24,7 @@ final class UibcProtocol {
         if (maskedAction != ACTION_DOWN
             && maskedAction != ACTION_UP
             && maskedAction != ACTION_MOVE
+            && maskedAction != ACTION_CANCEL
             && maskedAction != ACTION_POINTER_DOWN
             && maskedAction != ACTION_POINTER_UP) {
             throw new IllegalArgumentException("不支持的触控 action：" + action);
@@ -36,11 +38,9 @@ final class UibcProtocol {
             .append(",\"height\":").append(HEIGHT)
             .append(",\"count\":").append(trackIds.length);
         for (int index = 0; index < trackIds.length; index++) {
-            int x = Math.max(0, Math.min(WIDTH - 1, xs[index]));
-            int y = Math.max(0, Math.min(HEIGHT - 1, ys[index]));
             json.append(",\"trackID").append(index).append("\":").append(trackIds[index])
-                .append(",\"x").append(index).append("\":").append(x)
-                .append(",\"y").append(index).append("\":").append(y);
+                .append(",\"x").append(index).append("\":").append(xs[index])
+                .append(",\"y").append(index).append("\":").append(ys[index]);
         }
         return json.append('}').toString().getBytes(StandardCharsets.UTF_8);
     }

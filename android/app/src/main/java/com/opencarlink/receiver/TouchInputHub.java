@@ -4,7 +4,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 final class TouchInputHub {
     interface Sender {
-        boolean send(byte[] payload, boolean replaceable);
+        boolean send(byte[] payload);
     }
 
     private static final AtomicReference<Sender> ACTIVE = new AtomicReference<>();
@@ -23,15 +23,12 @@ final class TouchInputHub {
 
     static boolean sendTouch(int action, int[] trackIds, int[] xs, int[] ys) {
         Sender sender = ACTIVE.get();
-        return sender != null && sender.send(
-            UibcProtocol.touch(action, trackIds, xs, ys),
-            (action & 0xff) == UibcProtocol.ACTION_MOVE
-        );
+        return sender != null && sender.send(UibcProtocol.touch(action, trackIds, xs, ys));
     }
 
     static boolean sendKey(int keyCode) {
         Sender sender = ACTIVE.get();
-        return sender != null && sender.send(UibcProtocol.key(keyCode), false);
+        return sender != null && sender.send(UibcProtocol.key(keyCode));
     }
 
     private TouchInputHub() {
