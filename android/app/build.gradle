@@ -10,8 +10,8 @@ android {
         applicationId "com.opencarlink.receiver"
         minSdk 29
         targetSdk 35
-        versionCode 27
-        versionName "0.15.1"
+        versionCode 31
+        versionName "0.15.1-no-memory.4"
     }
 
     buildTypes {

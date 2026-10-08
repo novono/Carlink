@@ -27,6 +27,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.ParcelUuid;
+import android.os.SystemClock;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -45,6 +46,9 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 final class WirelessCarLinkEngine {
     interface Callback {
@@ -53,6 +57,8 @@ final class WirelessCarLinkEngine {
         void onLog(String message);
 
         void onFatal(String message);
+
+        void onDisconnected(String reason);
     }
 
     private static final int AUTH_PORT = 57209;
@@ -62,10 +68,19 @@ final class WirelessCarLinkEngine {
     private final Callback callback;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService io = Executors.newCachedThreadPool();
-    private final String requestedSsid = IccoaProtocol.randomSsid();
-    private final String requestedPassphrase = IccoaProtocol.randomPassphrase();
+    private String requestedSsid = IccoaProtocol.randomSsid();
+    private String requestedPassphrase = IccoaProtocol.randomPassphrase();
     private volatile String pin = IccoaProtocol.randomPin();
-    private final IccoaProtocol.Identity identity;
+    private IccoaProtocol.Identity identity;
+    private final Set<Socket> authClients = ConcurrentHashMap.newKeySet();
+    private final Map<Socket, AndroidAuthStore> authStores = new ConcurrentHashMap<>();
+    private final Map<Socket, IccoaAuthSession> authSessions = new ConcurrentHashMap<>();
+    private final AtomicBoolean disconnected = new AtomicBoolean();
+    private boolean sawP2pClient;
+    private boolean groupQueryPending;
+    private long p2pLossSince;
+    private final Runnable verifyP2pLoss = this::requestGroupInfo;
+    private Socket activeAuthClient;
     private final Map<String, ByteArrayOutputStream> preparedWrites = new ConcurrentHashMap<>();
     private final Map<String, BluetoothDevice> connectedDevices = new ConcurrentHashMap<>();
     private final Map<String, Integer> negotiatedMtus = new ConcurrentHashMap<>();
@@ -121,15 +136,33 @@ final class WirelessCarLinkEngine {
     }
 
     void stop() {
-        stopped = true;
+        stop(cleared -> { });
+    }
+
+    void stop(Consumer<Boolean> released) {
+        WirelessSessionChannels channels;
+        synchronized (this) {
+            if (stopped) {
+                released.accept(false);
+                return;
+            }
+            stopped = true;
+            channels = sessionChannels;
+            sessionChannels = null;
+            for (Socket client : authClients) {
+                try { client.close(); } catch (IOException ignored) { }
+            }
+            authClients.clear();
+            for (IccoaAuthSession auth : authSessions.values()) { auth.clear(); }
+            authSessions.clear();
+            for (AndroidAuthStore store : authStores.values()) { store.clear(); }
+            authStores.clear();
+            activeAuthClient = null;
+        }
+        main.removeCallbacksAndMessages(null);
         stopBluetooth();
         closeAuthListener();
         releaseLowLatencyWifiLock();
-        WirelessSessionChannels channels = sessionChannels;
-        sessionChannels = null;
-        if (channels != null) {
-            channels.stop();
-        }
         io.shutdownNow();
         BroadcastReceiver receiver = wifiReceiver;
         wifiReceiver = null;
@@ -139,13 +172,81 @@ final class WirelessCarLinkEngine {
             } catch (IllegalArgumentException ignored) {
             }
         }
-        if (wifiManager != null && wifiChannel != null) {
-            try {
-                wifiManager.removeGroup(wifiChannel, new QuietActionListener());
-            } catch (SecurityException ignored) {
+        preparedWrites.clear();
+        connectedDevices.clear();
+        negotiatedMtus.clear();
+        subscribedDevices.clear();
+        pendingServerInfo.clear();
+        indicatingDevices.clear();
+        group = null;
+        ssid = passphrase = address = pin = requestedSsid = requestedPassphrase = "";
+        identity = null;
+        frequency = 0;
+        WifiP2pManager manager = wifiManager;
+        WifiP2pManager.Channel channel = wifiChannel;
+        wifiManager = null;
+        wifiChannel = null;
+        Consumer<Boolean> finished = cleared -> {
+            if (channel != null) { channel.close(); }
+            released.accept(cleared);
+        };
+        Runnable releaseNetwork = () -> {
+            if (manager != null && channel != null) {
+                removeGroupAndAwait(manager, channel, finished);
+            } else {
+                finished.accept(true);
+            }
+        };
+        if (channels != null) {
+            channels.stop(() -> main.post(releaseNetwork));
+        } else {
+            releaseNetwork.run();
+        }
+    }
+
+    /** Action success only accepts removal; group info must confirm that removal finished. */
+    private void removeGroupAndAwait(WifiP2pManager manager, WifiP2pManager.Channel channel,
+            Consumer<Boolean> finished) {
+        class Removal {
+            final AtomicBoolean complete = new AtomicBoolean();
+            final long deadline = SystemClock.elapsedRealtime() + 8_000L;
+            final Runnable timeout = () -> finish(false);
+
+            void finish(boolean cleared) {
+                if (complete.compareAndSet(false, true)) {
+                    main.removeCallbacks(timeout);
+                    finished.accept(cleared);
+                }
+            }
+
+            void remove() {
+                if (complete.get()) { return; }
+                if (SystemClock.elapsedRealtime() >= deadline) { finish(false); return; }
+                try {
+                    manager.removeGroup(channel, new WifiP2pManager.ActionListener() {
+                        @Override public void onSuccess() { poll(); }
+                        @Override public void onFailure(int reason) { poll(); }
+                    });
+                } catch (RuntimeException error) { finish(false); }
+            }
+
+            void poll() {
+                if (complete.get()) { return; }
+                try {
+                    manager.requestGroupInfo(channel, value -> {
+                        if (complete.get()) { return; }
+                        if (value == null) {
+                            finish(true);
+                        } else {
+                            main.postDelayed(this::remove, 300L);
+                        }
+                    });
+                } catch (RuntimeException error) { finish(false); }
             }
         }
-        callback.onLog("无线资源已释放");
+        Removal removal = new Removal();
+        main.postDelayed(removal.timeout, 8_000L);
+        removal.remove();
     }
 
     private void acquireLowLatencyWifiLock() {
@@ -213,16 +314,10 @@ final class WirelessCarLinkEngine {
     }
 
     private void removeOldGroupThenCreate() {
-        wifiManager.removeGroup(wifiChannel, new WifiP2pManager.ActionListener() {
-            @Override
-            public void onSuccess() {
-                createGroup();
-            }
-
-            @Override
-            public void onFailure(int reason) {
-                createGroup();
-            }
+        removeGroupAndAwait(wifiManager, wifiChannel, cleared -> {
+            if (stopped) { return; }
+            if (cleared) { createGroup(); }
+            else { fail("旧 Wi-Fi Direct 群组未释放，请重试"); }
         });
     }
 
@@ -274,17 +369,35 @@ final class WirelessCarLinkEngine {
     }
 
     private void requestGroupInfo() {
+        if (stopped || wifiManager == null || wifiChannel == null || groupQueryPending) {
+            return;
+        }
+        groupQueryPending = true;
         try {
-            wifiManager.requestGroupInfo(wifiChannel, this::onGroupInfo);
+            wifiManager.requestGroupInfo(wifiChannel, value -> {
+                groupQueryPending = false;
+                onGroupInfo(value);
+            });
         } catch (SecurityException error) {
+            groupQueryPending = false;
             fail("读取 P2P group info 被拒绝：" + error.getMessage());
         }
     }
 
     private synchronized void onGroupInfo(WifiP2pGroup value) {
-        if (stopped || value == null || !value.isGroupOwner()) {
+        if (stopped) { return; }
+        if (value == null || !value.isGroupOwner()) {
+            if (!ssid.isEmpty()) { confirmP2pLoss("Wi-Fi Direct 连接已断开"); }
             return;
         }
+        if (!value.getClientList().isEmpty()) {
+            sawP2pClient = true;
+        } else if (sawP2pClient) {
+            confirmP2pLoss("手机已离开 Wi-Fi Direct");
+            return;
+        }
+        p2pLossSince = 0;
+        main.removeCallbacks(verifyP2pLoss);
         group = value;
         String groupSsid = value.getNetworkName();
         String groupPassphrase = value.getPassphrase();
@@ -316,6 +429,19 @@ final class WirelessCarLinkEngine {
         startAuthListener();
     }
 
+    private void confirmP2pLoss(String reason) {
+        long now = SystemClock.elapsedRealtime();
+        if (p2pLossSince == 0) { p2pLossSince = now; }
+        if (sessionChannels != null && sessionChannels.hasRecentMediaTraffic()) {
+            p2pLossSince = now;
+        } else if (now - p2pLossSince >= 2_000L) {
+            disconnected(reason);
+            return;
+        }
+        main.removeCallbacks(verifyP2pLoss);
+        main.postDelayed(verifyP2pLoss, 2_000L);
+    }
+
     private String interfaceAddress(String interfaceName) {
         if (interfaceName == null || interfaceName.isEmpty()) {
             return "";
@@ -345,14 +471,36 @@ final class WirelessCarLinkEngine {
                 listener.setReuseAddress(true);
                 listener.bind(new InetSocketAddress("0.0.0.0", AUTH_PORT));
                 listener.setSoTimeout(500);
-                authListener = listener;
+                synchronized (this) {
+                    if (stopped) { listener.close(); return; }
+                    authListener = listener;
+                }
                 callback.onLog("AUTH 已监听 TCP " + AUTH_PORT);
                 main.post(this::startBluetooth);
                 while (!stopped) {
                     try {
                         Socket client = listener.accept();
-                        configureClient(client);
-                        io.execute(() -> readAuthClient(client));
+                        try {
+                            configureClient(client);
+                        } catch (IOException error) {
+                            client.close();
+                            continue;
+                        }
+                        synchronized (this) {
+                            if (stopped || activeAuthClient != null || sessionChannels != null) {
+                                client.close();
+                                continue;
+                            }
+                            activeAuthClient = client;
+                            authClients.add(client);
+                            try {
+                                io.execute(() -> readAuthClient(client));
+                            } catch (RejectedExecutionException error) {
+                                authClients.remove(client);
+                                activeAuthClient = null;
+                                client.close();
+                            }
+                        }
                     } catch (SocketTimeoutException ignored) {
                     }
                 }
@@ -373,10 +521,18 @@ final class WirelessCarLinkEngine {
     private void readAuthClient(Socket client) {
         String peer = client.getInetAddress().getHostAddress();
         callback.onLog("手机已连接 AUTH：" + peer);
-        callback.onState(4, "正在认证 OPPO 手机", peer + ":" + client.getPort(), pin);
+        callback.onState(4, "正在认证手机", peer + ":" + client.getPort(), pin);
         byte[] buffer = new byte[64 * 1024];
         long total = 0;
-        IccoaAuthSession auth = new IccoaAuthSession(pin, new AndroidAuthStore(context));
+        AndroidAuthStore store;
+        IccoaAuthSession auth;
+        synchronized (this) {
+            if (stopped) { return; }
+            store = new AndroidAuthStore(context);
+            auth = new IccoaAuthSession(pin, store);
+            authStores.put(client, store);
+            authSessions.put(client, auth);
+        }
         IccoaAuthSession.StreamDecoder decoder = new IccoaAuthSession.StreamDecoder();
         boolean reportedSuccess = false;
         try (client) {
@@ -400,12 +556,17 @@ final class WirelessCarLinkEngine {
                         }
                         if (auth.isConfirmed() && !reportedSuccess) {
                             reportedSuccess = true;
-                            String detail = auth.connectionInfo().isEmpty()
-                                ? peer
-                                : auth.connectionInfo();
+                            String connectionInfo = auth.connectionInfo();
+                            String detail = connectionInfo == null || connectionInfo.isEmpty()
+                                ? peer : connectionInfo;
                             callback.onState(5, "无线认证成功", detail, pin);
                             callback.onLog("AUTH_CONFIRM 已完成；正在建立 CONTROL/RTSP/RTP");
-                            startSessionChannels(phoneAddress(auth.connectionInfo(), peer), auth.sessionKey());
+                            byte[] key = auth.sessionKey();
+                            try {
+                                startSessionChannels(phoneAddress(connectionInfo, peer), key);
+                            } finally {
+                                if (key != null) { Arrays.fill(key, (byte) 0); }
+                            }
                         }
                     }
                 } catch (SocketTimeoutException ignored) {
@@ -420,7 +581,17 @@ final class WirelessCarLinkEngine {
                 callback.onLog("AUTH 通道结束：" + error.getMessage());
             }
         } finally {
-            callback.onLog("AUTH 连接关闭，累计 " + total + " 字节");
+            auth.clear();
+            store.clear();
+            decoder.clear();
+            Arrays.fill(buffer, (byte) 0);
+            synchronized (this) {
+                authClients.remove(client);
+                authStores.remove(client);
+                authSessions.remove(client);
+                if (activeAuthClient == client) { activeAuthClient = null; }
+            }
+            if (!stopped && !reportedSuccess) { disconnected("认证连接已结束"); }
         }
     }
 
@@ -439,6 +610,11 @@ final class WirelessCarLinkEngine {
             @Override
             public void onState(int stage, String state, String detail) {
                 callback.onState(stage, state, detail, pin);
+            }
+
+            @Override
+            public void onDisconnected(String reason) {
+                disconnected(reason);
             }
             }
         );
@@ -517,6 +693,7 @@ final class WirelessCarLinkEngine {
     }
 
     private void startAdvertising() {
+        if (stopped || advertiser == null || identity == null) { return; }
         AdvertiseSettings settings = new AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
@@ -543,8 +720,9 @@ final class WirelessCarLinkEngine {
         advertiseCallback = new AdvertiseCallback() {
             @Override
             public void onStartSuccess(AdvertiseSettings settingsInEffect) {
+                if (stopped) { return; }
                 callback.onLog("ICCOA BLE 广播已启动：FCFB + INFO1 + INFO2");
-                callback.onState(2, "等待 OPPO 手机", ssid + " · " + frequency + " MHz", pin);
+                callback.onState(2, "等待手机", ssid + " · " + frequency + " MHz", pin);
             }
 
             @Override
@@ -562,37 +740,49 @@ final class WirelessCarLinkEngine {
     private final BluetoothGattServerCallback gattCallback = new BluetoothGattServerCallback() {
         @Override
         public void onServiceAdded(int status, BluetoothGattService service) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                fail("GATT service 注册失败：" + status);
-                return;
-            }
-            callback.onLog("ICCOA GATT service 已注册");
-            main.post(WirelessCarLinkEngine.this::startAdvertising);
+            main.post(() -> {
+                if (stopped) { return; }
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    fail("GATT service 注册失败：" + status);
+                    return;
+                }
+                callback.onLog("ICCOA GATT service 已注册");
+                main.post(WirelessCarLinkEngine.this::startAdvertising);
+
+            });
         }
 
         @Override
         public void onConnectionStateChange(BluetoothDevice device, int status, int newState) {
-            String key = device.getAddress();
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                connectedDevices.put(key, device);
-                negotiatedMtus.put(key, DEFAULT_MTU);
-                callback.onLog("手机已连接 BLE GATT：" + maskedAddress(key));
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                connectedDevices.remove(key);
-                negotiatedMtus.remove(key);
-                subscribedDevices.remove(key);
-                pendingServerInfo.remove(key);
-                indicatingDevices.remove(key);
-                preparedWrites.remove(key);
-                callback.onLog("BLE GATT 已断开：" + maskedAddress(key));
-            }
+            main.post(() -> {
+                if (stopped) { return; }
+                String key = device.getAddress();
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    connectedDevices.put(key, device);
+                    negotiatedMtus.put(key, DEFAULT_MTU);
+                    callback.onLog("手机已连接 BLE GATT：" + maskedAddress(key));
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    connectedDevices.remove(key);
+                    negotiatedMtus.remove(key);
+                    subscribedDevices.remove(key);
+                    pendingServerInfo.remove(key);
+                    indicatingDevices.remove(key);
+                    preparedWrites.remove(key);
+                    callback.onLog("BLE GATT 已断开：" + maskedAddress(key));
+                }
+
+            });
         }
 
         @Override
         public void onMtuChanged(BluetoothDevice device, int mtu) {
-            negotiatedMtus.put(device.getAddress(), mtu);
-            callback.onLog("BLE MTU：" + mtu);
-            trySendServerInfo(device);
+            main.post(() -> {
+                if (stopped) { return; }
+                negotiatedMtus.put(device.getAddress(), mtu);
+                callback.onLog("BLE MTU：" + mtu);
+                trySendServerInfo(device);
+
+            });
         }
 
         @Override
@@ -605,47 +795,55 @@ final class WirelessCarLinkEngine {
             int offset,
             byte[] value
         ) {
-            if (!IccoaProtocol.CLIENT_INFO_UUID.equals(characteristic.getUuid())) {
-                respond(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null, responseNeeded);
-                return;
-            }
-            String key = device.getAddress();
-            if (preparedWrite) {
-                ByteArrayOutputStream output = preparedWrites.computeIfAbsent(
-                    key,
-                    ignored -> new ByteArrayOutputStream()
-                );
-                synchronized (output) {
-                    if (offset != output.size()) {
-                        respond(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null, responseNeeded);
-                        return;
+            main.post(() -> {
+                if (stopped) { return; }
+                if (!IccoaProtocol.CLIENT_INFO_UUID.equals(characteristic.getUuid())) {
+                    respond(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null, responseNeeded);
+                    return;
+                }
+                String key = device.getAddress();
+                if (preparedWrite) {
+                    ByteArrayOutputStream output = preparedWrites.computeIfAbsent(
+                        key,
+                        ignored -> new ByteArrayOutputStream()
+                    );
+                    synchronized (output) {
+                        if (offset != output.size()) {
+                            respond(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null, responseNeeded);
+                            return;
+                        }
+                        output.write(value, 0, value.length);
                     }
-                    output.write(value, 0, value.length);
+                    respond(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value, responseNeeded);
+                    return;
+                }
+                if (offset != 0) {
+                    respond(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null, responseNeeded);
+                    return;
                 }
                 respond(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value, responseNeeded);
-                return;
-            }
-            if (offset != 0) {
-                respond(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null, responseNeeded);
-                return;
-            }
-            respond(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value, responseNeeded);
-            processClientInfo(device, value);
+                processClientInfo(device, value);
+
+            });
         }
 
         @Override
         public void onExecuteWrite(BluetoothDevice device, int requestId, boolean execute) {
-            ByteArrayOutputStream output = preparedWrites.remove(device.getAddress());
-            if (!execute || output == null) {
+            main.post(() -> {
+                if (stopped) { return; }
+                ByteArrayOutputStream output = preparedWrites.remove(device.getAddress());
+                if (!execute || output == null) {
+                    respond(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null, true);
+                    return;
+                }
+                byte[] value;
+                synchronized (output) {
+                    value = output.toByteArray();
+                }
                 respond(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null, true);
-                return;
-            }
-            byte[] value;
-            synchronized (output) {
-                value = output.toByteArray();
-            }
-            respond(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null, true);
-            processClientInfo(device, value);
+                processClientInfo(device, value);
+
+            });
         }
 
         @Override
@@ -658,20 +856,24 @@ final class WirelessCarLinkEngine {
             int offset,
             byte[] value
         ) {
-            if (!IccoaProtocol.CCCD_UUID.equals(descriptor.getUuid())) {
-                respondDescriptor(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, responseNeeded);
-                return;
-            }
-            boolean enabled = Arrays.equals(value, BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
-                || Arrays.equals(value, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-            if (enabled) {
-                subscribedDevices.add(device.getAddress());
-                callback.onLog("手机已订阅 Server Info indication");
-            } else {
-                subscribedDevices.remove(device.getAddress());
-            }
-            respondDescriptor(device, requestId, BluetoothGatt.GATT_SUCCESS, responseNeeded);
-            trySendServerInfo(device);
+            main.post(() -> {
+                if (stopped) { return; }
+                if (!IccoaProtocol.CCCD_UUID.equals(descriptor.getUuid())) {
+                    respondDescriptor(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, responseNeeded);
+                    return;
+                }
+                boolean enabled = Arrays.equals(value, BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
+                    || Arrays.equals(value, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                if (enabled) {
+                    subscribedDevices.add(device.getAddress());
+                    callback.onLog("手机已订阅 Server Info indication");
+                } else {
+                    subscribedDevices.remove(device.getAddress());
+                }
+                respondDescriptor(device, requestId, BluetoothGatt.GATT_SUCCESS, responseNeeded);
+                trySendServerInfo(device);
+
+            });
         }
 
         @Override
@@ -681,31 +883,41 @@ final class WirelessCarLinkEngine {
             int offset,
             BluetoothGattDescriptor descriptor
         ) {
-            if (!IccoaProtocol.CCCD_UUID.equals(descriptor.getUuid())) {
-                respondDescriptor(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, true);
-                return;
-            }
-            byte[] value = subscribedDevices.contains(device.getAddress())
-                ? BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                : BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE;
-            respond(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value, true);
+            main.post(() -> {
+                if (stopped) { return; }
+                if (!IccoaProtocol.CCCD_UUID.equals(descriptor.getUuid())) {
+                    respondDescriptor(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, true);
+                    return;
+                }
+                byte[] value = subscribedDevices.contains(device.getAddress())
+                    ? BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                    : BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE;
+                respond(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value, true);
+
+            });
         }
 
         @Override
         public void onNotificationSent(BluetoothDevice device, int status) {
-            String key = device.getAddress();
-            indicatingDevices.remove(key);
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                pendingServerInfo.remove(key);
-                callback.onLog("手机已确认 Server Info indication");
-            } else {
-                callback.onLog("Server Info indication 失败：" + status + "，准备重试");
-                main.postDelayed(() -> trySendServerInfo(device), 500L);
-            }
+            main.post(() -> {
+                if (stopped) { return; }
+                String key = device.getAddress();
+                indicatingDevices.remove(key);
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    pendingServerInfo.remove(key);
+                    callback.onLog("手机已确认 Server Info indication");
+                } else {
+                    callback.onLog("Server Info indication 失败：" + status + "，准备重试");
+                    main.postDelayed(() -> trySendServerInfo(device), 500L);
+                }
+
+            });
         }
     };
 
+
     private void processClientInfo(BluetoothDevice device, byte[] value) {
+        if (stopped || sessionChannels != null || activeAuthClient != null) { return; }
         String key = device.getAddress();
         pendingServerInfo.add(key);
         String label = IccoaProtocol.clientLabel(value);
@@ -720,6 +932,7 @@ final class WirelessCarLinkEngine {
     }
 
     private void trySendServerInfo(BluetoothDevice device) {
+        if (stopped || gattServer == null || serverCharacteristic == null) { return; }
         String key = device.getAddress();
         if (!pendingServerInfo.contains(key)
             || indicatingDevices.contains(key)) {
@@ -805,8 +1018,12 @@ final class WirelessCarLinkEngine {
         }
         BluetoothGattServer server = gattServer;
         gattServer = null;
+        serverCharacteristic = null;
         if (server != null) {
             try {
+                for (BluetoothDevice device : connectedDevices.values()) {
+                    server.cancelConnection(device);
+                }
                 server.clearServices();
                 server.close();
             } catch (SecurityException ignored) {
@@ -822,6 +1039,12 @@ final class WirelessCarLinkEngine {
                 listener.close();
             } catch (IOException ignored) {
             }
+        }
+    }
+
+    private void disconnected(String reason) {
+        if (!stopped && disconnected.compareAndSet(false, true)) {
+            callback.onDisconnected(reason);
         }
     }
 

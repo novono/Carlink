@@ -62,6 +62,8 @@ public final class MainActivity extends Activity {
     private View diagnosticView;
     private View playbackLayer;
     private DirectTsVideoDecoder decoder;
+    private volatile long playerGeneration;
+    private long playerSessionId = -1;
     private boolean firstFrameReported;
     private boolean playbackMode;
     private float carUiScale = 3f;
@@ -85,6 +87,10 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // Clear legacy records even if the receiver is never started after an upgrade.
+        getSharedPreferences("carlink_auth", MODE_PRIVATE).edit().clear().commit();
+        getSharedPreferences("carlink", MODE_PRIVATE).edit().clear().commit();
+        new DiagnosticLog(getApplicationContext());
         Window window = getWindow();
         window.setStatusBarColor(Color.rgb(16, 20, 18));
         window.setNavigationBarColor(Color.rgb(16, 20, 18));
@@ -579,7 +585,7 @@ public final class MainActivity extends Activity {
     }
 
     private void render(CarLinkService.Snapshot snapshot) {
-        boolean streaming = snapshot.stage >= 8;
+        boolean streaming = snapshot.running && snapshot.stage >= 8;
         boolean failed = snapshot.state.contains("失败") || snapshot.state.contains("错误");
         int statusColor = failed
             ? Color.rgb(242, 102, 102)
@@ -599,6 +605,7 @@ public final class MainActivity extends Activity {
         playbackLayer.setVisibility(streaming ? View.VISIBLE : View.GONE);
         diagnosticView.setVisibility(streaming ? View.GONE : View.VISIBLE);
         setPlaybackMode(streaming);
+        if (decoder != null && playerSessionId != snapshot.sessionId) { stopPlayer(); }
         if (streaming) {
             startPlayer();
         } else {
@@ -652,9 +659,14 @@ public final class MainActivity extends Activity {
     }
 
     private void startPlayer() {
+        CarLinkService.Snapshot current = CarLinkService.snapshot();
+        if (!current.running || current.stage < 8) { return; }
         if (decoder != null || videoView == null || !videoView.getHolder().getSurface().isValid()) {
             return;
         }
+        final long token = ++playerGeneration;
+        final long sessionId = current.sessionId;
+        playerSessionId = sessionId;
         firstFrameReported = false;
         DirectTsVideoDecoder value = new DirectTsVideoDecoder(
             this,
@@ -662,7 +674,7 @@ public final class MainActivity extends Activity {
             new DirectTsVideoDecoder.Listener() {
             @Override
             public void onDecoderReady(String codecName, boolean lowLatency) {
-                reportVideoStatus(
+                reportVideoStatus(token, sessionId,
                     "直通硬件解码器已就绪：" + codecName
                         + (lowLatency ? "（低延迟模式）" : "")
                 );
@@ -670,20 +682,22 @@ public final class MainActivity extends Activity {
 
             @Override
             public void onVideoSize(int width, int height) {
-                reportVideoStatus("识别视频画面：" + width + "x" + height);
+                reportVideoStatus(token, sessionId, "识别视频画面：" + width + "x" + height);
             }
 
             @Override
             public void onFirstFrame() {
-                if (!firstFrameReported) {
-                    firstFrameReported = true;
-                    reportVideoStatus("首帧已直通渲染，画面开始显示");
-                }
+                runOnUiThread(() -> {
+                    if (playerGeneration == token && !firstFrameReported) {
+                        firstFrameReported = true;
+                        reportVideoStatus(token, sessionId, "首帧已直通渲染，画面开始显示");
+                    }
+                });
             }
 
             @Override
             public void onError(String message) {
-                reportVideoStatus(message);
+                reportVideoStatus(token, sessionId, message);
             }
             }
         );
@@ -692,6 +706,8 @@ public final class MainActivity extends Activity {
     }
 
     private void stopPlayer() {
+        ++playerGeneration;
+        playerSessionId = -1;
         DirectTsVideoDecoder value = decoder;
         decoder = null;
         if (value != null) {
@@ -699,12 +715,16 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void reportVideoStatus(String message) {
-        startService(
+    private void reportVideoStatus(long token, long sessionId, String message) {
+        runOnUiThread(() -> {
+            if (token != playerGeneration || decoder == null) { return; }
+            startService(
             new Intent(this, CarLinkService.class)
                 .setAction(CarLinkService.ACTION_VIDEO_STATUS)
                 .putExtra(CarLinkService.EXTRA_VIDEO_STATUS, message)
-        );
+                .putExtra(CarLinkService.EXTRA_SESSION_ID, sessionId)
+            );
+        });
     }
 
     private String versionName() {

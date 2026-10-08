@@ -12,8 +12,10 @@ final class UCarControlProtocol {
     private static final int MESSAGE_SEND = 0;
     private static final int MESSAGE_REQ = 1;
     private static final int MESSAGE_RES = 2;
+    private static final int MESSAGE_NOTIFY = 3;
     private static final int CATEGORY_CONTROL = 1;
     private static final int METHOD_HEARTBEAT = 1;
+    private static final int METHOD_SESSION_DISCONNECT = 7;
     private static final int METHOD_GET_CONFIG_REQUEST = 24;
     private static final int METHOD_GET_CONFIG_RESPONSE = 25;
 
@@ -95,6 +97,34 @@ final class UCarControlProtocol {
             ),
             body
         );
+    }
+
+    static byte[] buildSessionDisconnect(int sequenceId) {
+        if (sequenceId < 0) {
+            throw new IllegalArgumentException("断开通知 sequenceId 不能为负数");
+        }
+        byte[] body = IccoaAuthSession.fieldVarint(1, 1);
+        return IccoaAuthSession.concat(
+            IccoaAuthSession.buildHeader(
+                body.length,
+                sequenceId,
+                FORMAT_PB3,
+                MESSAGE_NOTIFY,
+                CATEGORY_CONTROL,
+                METHOD_SESSION_DISCONNECT,
+                0
+            ),
+            body
+        );
+    }
+
+    static boolean isSessionDisconnect(byte[] message) {
+        IccoaAuthSession.Header header = IccoaAuthSession.parseHeader(message);
+        int messageType = (message[12] & 0x18) >> 3;
+        return header.category == CATEGORY_CONTROL
+            && header.method == METHOD_SESSION_DISCONNECT
+            && header.dataFormat == FORMAT_PB3
+            && messageType == MESSAGE_NOTIFY;
     }
 
     private static byte[] replaceBody(byte[] message, byte[] body) {

@@ -12,10 +12,16 @@ final class RtspSinkSession {
     static final class Action {
         final String description;
         final byte[] response;
+        final boolean terminated;
 
         Action(String description, byte[] response) {
+            this(description, response, false);
+        }
+
+        Action(String description, byte[] response, boolean terminated) {
             this.description = description;
             this.response = response;
+            this.terminated = terminated;
         }
     }
 
@@ -27,10 +33,17 @@ final class RtspSinkSession {
     private final Map<Integer, String> pending = new HashMap<>();
     private String session = "";
     private String presentationUrl = "rtsp://127.0.0.1/wfd1.0/streamid=0";
+    private boolean teardownSent;
+    private boolean cleared;
 
-    List<Action> feed(byte[] data, int length) {
+    synchronized List<Action> feed(byte[] data, int length) {
+        if (cleared) {
+            return new ArrayList<>();
+        }
         int oldLength = buffer.length;
-        buffer = Arrays.copyOf(buffer, oldLength + length);
+        byte[] previous = buffer;
+        buffer = Arrays.copyOf(previous, oldLength + length);
+        Arrays.fill(previous, (byte) 0);
         System.arraycopy(data, 0, buffer, oldLength, length);
         List<Action> actions = new ArrayList<>();
         while (true) {
@@ -38,10 +51,40 @@ final class RtspSinkSession {
             if (parsed == null) {
                 break;
             }
-            buffer = Arrays.copyOfRange(buffer, parsed.consumed, buffer.length);
-            actions.addAll(handle(parsed));
+            previous = buffer;
+            buffer = Arrays.copyOfRange(previous, parsed.consumed, previous.length);
+            Arrays.fill(previous, (byte) 0);
+            try {
+                actions.addAll(handle(parsed));
+            } finally {
+                Arrays.fill(parsed.body, (byte) 0);
+            }
+            if (cleared) {
+                break;
+            }
         }
         return actions;
+    }
+
+    synchronized byte[] teardownRequest() {
+        if (cleared || teardownSent || session.isEmpty()) {
+            return new byte[0];
+        }
+        teardownSent = true;
+        return request(
+            "TEARDOWN", presentationUrl, new String[]{"Session: " + session}, "teardown"
+        );
+    }
+
+    synchronized void clear() {
+        cleared = true;
+        Arrays.fill(buffer, (byte) 0);
+        buffer = new byte[0];
+        session = "";
+        presentationUrl = "";
+        pending.clear();
+        sentOwnOptions = false;
+        teardownSent = true;
     }
 
     private List<Action> handle(Parsed message) {
@@ -55,6 +98,14 @@ final class RtspSinkSession {
                 return actions;
             }
             String waiting = pending.remove(number);
+            if ("teardown".equals(waiting)) {
+                actions.add(new Action("手机已回复 RTSP TEARDOWN，结束投屏会话", new byte[0], true));
+                clear();
+                return actions;
+            }
+            if (teardownSent) {
+                return actions;
+            }
             if ("setup".equals(waiting) && message.startLine.startsWith("RTSP/1.0 200")) {
                 session = message.headers.getOrDefault("session", "").split(";", 2)[0].trim();
                 if (!session.isEmpty()) {
@@ -83,9 +134,12 @@ final class RtspSinkSession {
             }
         } else if (message.startLine.startsWith("GET_PARAMETER ")) {
             byte[] body = message.body.length == 0 ? new byte[0] : capabilityBody();
-            actions.add(new Action("回复手机 RTSP 能力查询", response(cseq, new String[0], body)));
+            String description = message.body.length == 0
+                ? "回复手机 RTSP 保活" : "回复手机 RTSP 能力查询";
+            actions.add(new Action(description, response(cseq, sessionHeaders(message), body)));
         } else if (message.startLine.startsWith("SET_PARAMETER ")) {
             String body = new String(message.body, StandardCharsets.US_ASCII);
+            String trigger = "";
             for (String rawLine : body.split("\\r?\\n")) {
                 String line = rawLine.trim();
                 if (line.toLowerCase(Locale.US).startsWith("wfd_presentation_url:")) {
@@ -93,9 +147,15 @@ final class RtspSinkSession {
                     if (value.startsWith("rtsp://")) {
                         presentationUrl = value;
                     }
+                } else if (line.toLowerCase(Locale.US).startsWith("wfd_trigger_method:")) {
+                    trigger = line.substring(line.indexOf(':') + 1).trim().toUpperCase(Locale.US);
                 }
             }
-            if (body.contains("wfd_trigger_method: SETUP")) {
+            // WFD M5 must be acknowledged before initiating its triggered M6/M8 request.
+            actions.add(new Action(
+                "回复手机 RTSP 参数设置", response(cseq, sessionHeaders(message), new byte[0])
+            ));
+            if ("SETUP".equals(trigger) && !teardownSent) {
                 actions.add(new Action(
                     "手机触发 SETUP，发送 RTSP SETUP",
                     request(
@@ -105,10 +165,32 @@ final class RtspSinkSession {
                         "setup"
                     )
                 ));
+            } else if ("TEARDOWN".equals(trigger)) {
+                byte[] teardown = teardownRequest();
+                if (teardown.length > 0) {
+                    actions.add(new Action("手机触发 TEARDOWN，发送 RTSP TEARDOWN", teardown));
+                } else if (session.isEmpty()) {
+                    Action acknowledgement = actions.remove(actions.size() - 1);
+                    actions.add(new Action(acknowledgement.description, acknowledgement.response, true));
+                    clear();
+                }
             }
-            actions.add(new Action("回复手机 RTSP 参数设置", response(cseq, new String[0], new byte[0])));
+        } else if (message.startLine.startsWith("TEARDOWN ")) {
+            actions.add(new Action(
+                "手机结束 RTSP 投屏会话",
+                response(cseq, sessionHeaders(message), new byte[0]),
+                true
+            ));
+            clear();
         }
         return actions;
+    }
+
+    private String[] sessionHeaders(Parsed message) {
+        String value = session.isEmpty()
+            ? message.headers.getOrDefault("session", "").split(";", 2)[0].trim()
+            : session;
+        return value.isEmpty() ? new String[0] : new String[]{"Session: " + value};
     }
 
     private byte[] request(String method, String uri, String[] headers, String waiting) {

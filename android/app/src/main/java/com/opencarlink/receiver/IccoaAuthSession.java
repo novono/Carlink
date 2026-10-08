@@ -53,16 +53,23 @@ final class IccoaAuthSession {
 
     static final class StreamDecoder {
         private byte[] buffer = new byte[0];
+        private boolean cleared;
 
-        List<byte[]> feed(byte[] data, int length) {
+        synchronized List<byte[]> feed(byte[] data, int length) {
+            if (cleared) {
+                throw new IllegalStateException("Authentication stream has ended");
+            }
             int oldLength = buffer.length;
-            buffer = Arrays.copyOf(buffer, oldLength + length);
+            byte[] previous = buffer;
+            buffer = Arrays.copyOf(previous, oldLength + length);
+            Arrays.fill(previous, (byte) 0);
             System.arraycopy(data, 0, buffer, oldLength, length);
             List<byte[]> messages = new ArrayList<>();
             int offset = 0;
             while (buffer.length - offset >= HEADER_SIZE) {
                 int messageLength = ByteBuffer.wrap(buffer, offset, 4).getInt();
                 if (messageLength < HEADER_SIZE || messageLength > MAX_MESSAGE_LENGTH) {
+                    Arrays.fill(buffer, (byte) 0);
                     buffer = new byte[0];
                     throw new IllegalArgumentException("UCar 消息长度无效：" + messageLength);
                 }
@@ -75,9 +82,17 @@ final class IccoaAuthSession {
                 offset += messageLength;
             }
             if (offset > 0) {
-                buffer = Arrays.copyOfRange(buffer, offset, buffer.length);
+                previous = buffer;
+                buffer = Arrays.copyOfRange(previous, offset, previous.length);
+                Arrays.fill(previous, (byte) 0);
             }
             return messages;
+        }
+
+        synchronized void clear() {
+            cleared = true;
+            Arrays.fill(buffer, (byte) 0);
+            buffer = new byte[0];
         }
     }
 
@@ -107,35 +122,55 @@ final class IccoaAuthSession {
     private static final int METHOD_AUTH_CONFIRM = 3;
     private static final SecureRandom RANDOM = new SecureRandom();
 
-    private final String pin;
-    private final Store store;
+    private byte[] pin;
+    private Store store;
     private byte[] sessionKey;
     private String phoneId = "";
     private String connectionInfo = "";
     private boolean confirmed;
+    private boolean cleared;
 
     IccoaAuthSession(String pin, Store store) {
-        this.pin = pin;
+        this.pin = pin.getBytes(StandardCharsets.UTF_8);
         this.store = store;
     }
 
-    boolean isConfirmed() {
+    synchronized boolean isConfirmed() {
         return confirmed;
     }
 
-    byte[] sessionKey() {
+    synchronized byte[] sessionKey() {
         return sessionKey == null ? null : sessionKey.clone();
     }
 
-    String phoneId() {
+    synchronized String phoneId() {
         return phoneId;
     }
 
-    String connectionInfo() {
+    synchronized String connectionInfo() {
         return connectionInfo;
     }
 
-    Result handle(byte[] message) throws GeneralSecurityException {
+    synchronized void clear() {
+        cleared = true;
+        if (sessionKey != null) {
+            Arrays.fill(sessionKey, (byte) 0);
+            sessionKey = null;
+        }
+        if (pin != null) {
+            Arrays.fill(pin, (byte) 0);
+            pin = null;
+        }
+        phoneId = null;
+        connectionInfo = null;
+        confirmed = false;
+        store = null;
+    }
+
+    synchronized Result handle(byte[] message) throws GeneralSecurityException {
+        if (cleared) {
+            throw new GeneralSecurityException("Authentication session has ended");
+        }
         Header header = parseHeader(message);
         if (header.category != CATEGORY_AUTH || header.dataFormat != FORMAT_PB3) {
             throw new IllegalArgumentException("AUTH 通道收到非认证消息");
@@ -164,7 +199,7 @@ final class IccoaAuthSession {
             return new Result("手机认证请求缺少必要字段", resultResponse(header.sequenceId, 3));
         }
 
-        byte[] pinBytes = pin.getBytes(StandardCharsets.UTF_8);
+        byte[] pinBytes = pin;
         boolean normalConnection = phoneAuthRaw.length > 0 && phoneAuthHmac.length > 0;
         if (normalConnection) {
             byte[] expected = pinHmac(pinBytes, phoneNonce, phoneAuthRaw);
@@ -190,12 +225,18 @@ final class IccoaAuthSession {
         byte[] carAgreementRaw = rawPublicKey(carAgreementKey.getPublic());
         byte[] carNonce = new byte[32];
         RANDOM.nextBytes(carNonce);
-        sessionKey = deriveSessionKey(
+        byte[] negotiatedKey = deriveSessionKey(
             carAgreementKey.getPrivate(),
             phoneAgreementKey,
             phoneNonce,
             carNonce
         );
+        if (sessionKey != null) {
+            Arrays.fill(sessionKey, (byte) 0);
+        }
+        sessionKey = negotiatedKey;
+        confirmed = false;
+        connectionInfo = "";
         phoneId = new String(deviceId, StandardCharsets.UTF_8);
 
         byte[] responseAuthRaw;

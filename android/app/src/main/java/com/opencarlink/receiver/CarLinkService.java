@@ -8,28 +8,41 @@ import android.app.Service;
 import android.content.Intent;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
 
 import android.content.pm.PackageManager;
 
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 
-public final class CarLinkService extends Service implements WirelessCarLinkEngine.Callback {
+public final class CarLinkService extends Service {
     public static final String ACTION_START = "com.opencarlink.receiver.START";
     public static final String ACTION_STOP = "com.opencarlink.receiver.STOP";
     public static final String ACTION_UPDATE = "com.opencarlink.receiver.UPDATE";
     public static final String ACTION_VIDEO_STATUS = "com.opencarlink.receiver.VIDEO_STATUS";
     public static final String EXTRA_VIDEO_STATUS = "video_status";
+    public static final String EXTRA_SESSION_ID = "session_id";
     private static final String CHANNEL_ID = "carlink_receiver";
     private static final int NOTIFICATION_ID = 57209;
     private static final int MAX_LOG_CHARS = 12_000;
     private static final Object SNAPSHOT_LOCK = new Object();
     private static Snapshot current = Snapshot.idle();
+    private static final AtomicLong NEXT_GENERATION = new AtomicLong();
 
     private WirelessCarLinkEngine engine;
     private DiagnosticLog diagnosticLog;
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private long generation;
+    private boolean wantRunning;
+    private boolean releasing;
+    private boolean destroyed;
 
     public static final class Snapshot {
+        public final long sessionId;
         public final boolean running;
         public final int stage;
         public final String state;
@@ -38,6 +51,7 @@ public final class CarLinkService extends Service implements WirelessCarLinkEngi
         public final String log;
 
         Snapshot(
+            long sessionId,
             boolean running,
             int stage,
             String state,
@@ -45,6 +59,7 @@ public final class CarLinkService extends Service implements WirelessCarLinkEngi
             String pin,
             String log
         ) {
+            this.sessionId = sessionId;
             this.running = running;
             this.stage = stage;
             this.state = state;
@@ -54,7 +69,7 @@ public final class CarLinkService extends Service implements WirelessCarLinkEngi
         }
 
         static Snapshot idle() {
-            return new Snapshot(false, 0, "等待启动", "无线接收端未运行", "------", "");
+            return new Snapshot(0, false, 0, "等待启动", "无线接收端未运行", "------", "");
         }
     }
 
@@ -76,65 +91,121 @@ public final class CarLinkService extends Service implements WirelessCarLinkEngi
         String action = intent == null ? ACTION_START : intent.getAction();
         if (ACTION_VIDEO_STATUS.equals(action)) {
             String message = intent.getStringExtra(EXTRA_VIDEO_STATUS);
-            if (engine != null && message != null && !message.isEmpty()) {
-                onLog(message);
+            if (engine != null && intent.getLongExtra(EXTRA_SESSION_ID, -1) == generation
+                && message != null && !message.isEmpty()) {
+                log(message);
             }
+            if (!wantRunning && !releasing) { stopSelf(); }
             return START_NOT_STICKY;
         }
         if (ACTION_STOP.equals(action)) {
-            stopEngine();
-            stopForeground(STOP_FOREGROUND_REMOVE);
-            stopSelf();
+            Log.i("OpenCarLinkState", "manual stop requested");
+            wantRunning = false;
+            closeEngine("已停止", "设备记忆已清除，无线资源已释放");
             return START_NOT_STICKY;
         }
+        Log.i("OpenCarLinkState", "start requested");
+        wantRunning = true;
         startForeground(NOTIFICATION_ID, notification("正在启动无线车机"));
-        if (engine == null) {
-            diagnosticLog.reset();
-            diagnosticLog.append("应用版本：" + versionName());
-            update(true, 0, "正在启动", "准备 Wi-Fi Direct", "------", false);
-            engine = new WirelessCarLinkEngine(getApplicationContext(), this);
-            engine.start();
-        }
+        if (engine == null && !releasing) { startEngine(); }
         return START_NOT_STICKY;
+    }
+
+    private void startEngine() {
+        if (destroyed || !wantRunning || releasing || engine != null) { return; }
+        long token = NEXT_GENERATION.incrementAndGet();
+        generation = token;
+        clearSnapshot(true, "正在启动", "全新配对 · 不保存设备记忆");
+        WirelessCarLinkEngine.Callback scopedCallback = new WirelessCarLinkEngine.Callback() {
+            private final SessionProgress progress = new SessionProgress();
+            private void deliver(Runnable action) {
+                main.post(() -> {
+                    if (!destroyed && engine != null && generation == token) { action.run(); }
+                });
+            }
+
+            @Override public void onState(int stage, String state, String detail, String pin) {
+                deliver(() -> {
+                    if (!progress.advance(stage)) {
+                        Log.i("OpenCarLinkState", "ignored late stage=" + stage
+                            + " current=" + progress.stage());
+                        return;
+                    }
+                    Log.i("OpenCarLinkState", "stage=" + stage + " state=" + state);
+                    update(true, stage, state, detail, pin, false);
+                });
+            }
+            @Override public void onLog(String message) { deliver(() -> log(message)); }
+            @Override public void onFatal(String message) {
+                deliver(() -> {
+                    Log.i("OpenCarLinkState", "engine fatal");
+                    wantRunning = false;
+                    closeEngine("启动失败", message);
+                });
+            }
+            @Override public void onDisconnected(String reason) {
+                deliver(() -> {
+                    String source = reason.startsWith("CONTROL") ? "CONTROL"
+                        : reason.startsWith("RTP") ? "RTP"
+                        : reason.startsWith("RTSP") ? "RTSP" : "WiFi/session";
+                    Log.i("OpenCarLinkState", "disconnect source=" + source);
+                    closeEngine("正在清理连接", "结束上一场投屏并清空设备记忆");
+                });
+            }
+        };
+        engine = new WirelessCarLinkEngine(getApplicationContext(), scopedCallback);
+        engine.start();
+    }
+
+    private void closeEngine(String state, String detail) {
+        generation = NEXT_GENERATION.incrementAndGet(); // Invalidate callbacks before closing any old resource.
+        WirelessCarLinkEngine value = engine;
+        engine = null;
+        VideoStreamHub.reset();
+        diagnosticLog.reset();
+        clearSnapshot(wantRunning, state, detail);
+        if (releasing) { return; }
+        releasing = true;
+        Consumer<Boolean> released = cleared -> main.post(() -> {
+            releasing = false;
+            if (destroyed) { return; }
+            if (!cleared) {
+                wantRunning = false;
+                clearSnapshot(false, "清理失败", "Wi-Fi Direct 群组未释放，请重试");
+            }
+            if (wantRunning) {
+                startEngine(); // Old removeGroup has completed before creating the next GO.
+            } else {
+                stopForeground(STOP_FOREGROUND_REMOVE);
+                stopSelf();
+            }
+        });
+        if (value != null) { value.stop(released); } else { released.accept(true); }
     }
 
     @Override
     public void onDestroy() {
-        stopEngine();
+        destroyed = true;
+        wantRunning = false;
+        if (engine != null || snapshot().running) {
+            closeEngine("已停止", "设备记忆已清除，无线资源已释放");
+        }
         super.onDestroy();
     }
 
-    private void stopEngine() {
-        VideoStreamHub.reset();
-        WirelessCarLinkEngine value = engine;
-        engine = null;
-        if (value != null) {
-            value.stop();
-        }
+    private void clearSnapshot(boolean running, String state, String detail) {
         synchronized (SNAPSHOT_LOCK) {
-            String existingLog = current.log;
-            current = new Snapshot(false, 0, "已停止", "无线资源已释放", "------", existingLog);
+            current = new Snapshot(generation, running, 0, state, detail, "------", "");
+        }
+        if (running) {
+            getSystemService(NotificationManager.class).notify(NOTIFICATION_ID, notification(state));
         }
         sendBroadcast(new Intent(ACTION_UPDATE).setPackage(getPackageName()));
     }
 
-    @Override
-    public void onState(int stage, String state, String detail, String pin) {
-        diagnosticLog.append("STATE " + stage + "：" + state + "；" + detail);
-        update(true, stage, state, detail, pin, false);
-    }
-
-    @Override
-    public void onLog(String message) {
-        diagnosticLog.append("LOG：" + message);
-        update(true, snapshot().stage, snapshot().state, snapshot().detail, snapshot().pin, true, message);
-    }
-
-    @Override
-    public void onFatal(String message) {
-        onLog("错误：" + message);
-        update(true, snapshot().stage, "启动失败", message, snapshot().pin, false);
-        stopForeground(STOP_FOREGROUND_DETACH);
+    private void log(String message) {
+        Snapshot previous = snapshot();
+        update(true, previous.stage, previous.state, previous.detail, previous.pin, true, message);
     }
 
     private String versionName() {
@@ -179,7 +250,7 @@ public final class CarLinkService extends Service implements WirelessCarLinkEngi
                     log = log.substring(log.length() - MAX_LOG_CHARS);
                 }
             }
-            next = new Snapshot(running, stage, state, detail, pin, log);
+            next = new Snapshot(generation, running, stage, state, detail, pin, log);
             current = next;
         }
         NotificationManager manager = getSystemService(NotificationManager.class);

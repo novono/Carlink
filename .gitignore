@@ -14,4 +14,9 @@ android/.gradle/
 android/local.properties
 android/app/build/
 android/build/
-
+*.apk
+*.aab
+*.jks
+*.keystore
+hs_err_pid*.log
+replay_pid*.log

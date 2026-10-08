@@ -8,26 +8,29 @@ final class VideoStreamHub {
     private static final ArrayDeque<byte[]> QUEUE = new ArrayDeque<>();
     private static int headOffset;
     private static int bufferedBytes;
-    private static boolean ended;
+    private static boolean ended = true;
+    private static long sessionToken;
     private static Reader activeReader;
 
-    static void beginSession() {
+    static long beginSession() {
         synchronized (LOCK) {
+            sessionToken++;
             closeActiveReaderLocked();
             QUEUE.clear();
             headOffset = 0;
             bufferedBytes = 0;
             ended = false;
             LOCK.notifyAll();
+            return sessionToken;
         }
     }
 
-    static void feed(byte[] data) {
+    static void feed(long token, byte[] data) {
         if (data.length == 0) {
             return;
         }
         synchronized (LOCK) {
-            if (ended) {
+            if (ended || token != sessionToken) {
                 return;
             }
             QUEUE.addLast(data.clone());
@@ -41,28 +44,58 @@ final class VideoStreamHub {
         }
     }
 
-    static void endSession() {
+    static void endSession(long token) {
         synchronized (LOCK) {
-            closeActiveReaderLocked();
-            QUEUE.clear();
-            headOffset = 0;
-            bufferedBytes = 0;
-            ended = true;
-            LOCK.notifyAll();
+            if (token == sessionToken) {
+                clearSessionLocked();
+            }
         }
     }
 
     static void reset() {
-        endSession();
+        synchronized (LOCK) {
+            sessionToken++;
+            clearSessionLocked();
+        }
+    }
+
+    static long currentSessionToken() {
+        synchronized (LOCK) {
+            return sessionToken;
+        }
     }
 
     static Reader openReader() {
         synchronized (LOCK) {
-            closeActiveReaderLocked();
-            activeReader = new Reader();
-            LOCK.notifyAll();
-            return activeReader;
+            return openReaderLocked(sessionToken);
         }
+    }
+
+    static Reader openReader(long token) {
+        synchronized (LOCK) {
+            return openReaderLocked(token);
+        }
+    }
+
+    private static Reader openReaderLocked(long token) {
+        Reader reader = new Reader(token);
+        if (ended || token != sessionToken) {
+            reader.closed = true;
+        } else {
+            closeActiveReaderLocked();
+            activeReader = reader;
+            LOCK.notifyAll();
+        }
+        return reader;
+    }
+
+    private static void clearSessionLocked() {
+        closeActiveReaderLocked();
+        QUEUE.clear();
+        headOffset = 0;
+        bufferedBytes = 0;
+        ended = true;
+        LOCK.notifyAll();
     }
 
     private static void closeActiveReaderLocked() {
@@ -73,14 +106,19 @@ final class VideoStreamHub {
     }
 
     static final class Reader {
+        private final long token;
         private volatile boolean closed;
+
+        private Reader(long token) {
+            this.token = token;
+        }
 
         int read(byte[] target, int offset, int length) throws InterruptedException {
             synchronized (LOCK) {
-                while (QUEUE.isEmpty() && !ended && !closed) {
+                while (QUEUE.isEmpty() && !ended && !closed && token == sessionToken) {
                     LOCK.wait(500L);
                 }
-                if (closed || (QUEUE.isEmpty() && ended)) {
+                if (closed || token != sessionToken || (QUEUE.isEmpty() && ended)) {
                     return -1;
                 }
                 byte[] head = QUEUE.peekFirst();

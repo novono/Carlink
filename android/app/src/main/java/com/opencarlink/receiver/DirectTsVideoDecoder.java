@@ -34,6 +34,8 @@ import androidx.media3.extractor.ts.TsExtractor;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.List;
 
 /** Demuxes MPEG-TS and feeds H.264 access units straight into a surface decoder. */
 @UnstableApi
@@ -63,6 +65,7 @@ final class DirectTsVideoDecoder {
     private final Listener listener;
     private final AudioManager audioManager;
     private final AudioFocusRequest audioFocusRequest;
+    private final Object lifecycleLock = new Object();
     private final Object codecLock = new Object();
     private final Object audioCodecLock = new Object();
     private final VideoTrackOutput videoTrack = new VideoTrackOutput();
@@ -77,6 +80,7 @@ final class DirectTsVideoDecoder {
     private volatile MediaCodec audioCodec;
     private volatile AudioTrack audioPlayer;
     private volatile VideoStreamHub.Reader reader;
+    private long videoSessionToken;
     private Thread extractorThread;
     private Thread outputThread;
     private Thread audioOutputThread;
@@ -101,20 +105,30 @@ final class DirectTsVideoDecoder {
     }
 
     void start() {
-        if (extractorThread != null) {
-            return;
+        Thread extractor;
+        synchronized (lifecycleLock) {
+            if (stopped || extractorThread != null) {
+                return;
+            }
+            videoSessionToken = VideoStreamHub.currentSessionToken();
+            extractor = new Thread(this::runExtractor, "CarLink-TS-Demux");
+            extractorThread = extractor;
         }
-        extractorThread = new Thread(this::runExtractor, "CarLink-TS-Demux");
-        extractorThread.start();
+        extractor.start();
     }
 
     void stop() {
-        stopped = true;
-        VideoStreamHub.Reader activeReader = reader;
+        VideoStreamHub.Reader activeReader;
+        Thread extractor;
+        synchronized (lifecycleLock) {
+            stopped = true;
+            activeReader = reader;
+            reader = null;
+            extractor = extractorThread;
+        }
         if (activeReader != null) {
             activeReader.close();
         }
-        Thread extractor = extractorThread;
         if (extractor != null) {
             extractor.interrupt();
         }
@@ -139,7 +153,12 @@ final class DirectTsVideoDecoder {
             new DefaultTsPayloadReaderFactory(tsFlags)
         );
         try {
-            reader = VideoStreamHub.openReader();
+            synchronized (lifecycleLock) {
+                if (stopped) {
+                    return;
+                }
+                reader = VideoStreamHub.openReader(videoSessionToken);
+            }
             DataReader dataReader = (target, offset, length) -> readStream(target, offset, length);
             DefaultExtractorInput input = new DefaultExtractorInput(dataReader, 0, C.LENGTH_UNSET);
             extractor.init(new ExtractorOutput() {
@@ -178,8 +197,11 @@ final class DirectTsVideoDecoder {
             }
         } finally {
             extractor.release();
-            VideoStreamHub.Reader activeReader = reader;
-            reader = null;
+            VideoStreamHub.Reader activeReader;
+            synchronized (lifecycleLock) {
+                activeReader = reader;
+                reader = null;
+            }
             if (activeReader != null) {
                 activeReader.close();
             }
@@ -260,64 +282,83 @@ final class DirectTsVideoDecoder {
     }
 
     private void configureAudioCodec(Format format) {
-        if (audioCodec != null || audioDisabled || stopped) {
-            return;
-        }
-        String mimeType = format.sampleMimeType;
-        if (mimeType == null || !mimeType.startsWith("audio/")) {
-            return;
-        }
-        int sampleRate = format.sampleRate;
-        int channelCount = format.channelCount;
-        if (sampleRate <= 0 || channelCount <= 0) {
-            disableAudio("Invalid AAC format: sampleRate=" + sampleRate
-                + " channelCount=" + channelCount, null);
-            return;
-        }
-
-        MediaFormat mediaFormat = MediaFormat.createAudioFormat(
-            mimeType,
-            sampleRate,
-            channelCount
-        );
-        mediaFormat.setInteger(MediaFormat.KEY_PRIORITY, 0);
-        mediaFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 64 * 1024);
-        mediaFormat.setInteger(MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_16BIT);
-        for (int index = 0; index < format.initializationData.size(); index++) {
-            mediaFormat.setByteBuffer(
-                "csd-" + index,
-                ByteBuffer.wrap(format.initializationData.get(index))
-            );
-        }
-
+        if (audioCodec != null || audioDisabled || stopped) { return; }
         MediaCodec value = null;
         try {
-            value = MediaCodec.createDecoderByType(mimeType);
-            String codecName = value.getName();
-            value.configure(mediaFormat, null, null, 0);
-            value.start();
-            synchronized (audioCodecLock) {
-                if (stopped || audioDisabled) {
-                    return;
+            String mimeType = format.sampleMimeType;
+            if (mimeType == null || !mimeType.startsWith("audio/")) { return; }
+            int sampleRate = format.sampleRate;
+            int channelCount = format.channelCount;
+            if (sampleRate <= 0 || channelCount <= 0) {
+                throw new IllegalArgumentException("音频参数不完整：" + sampleRate + "Hz/" + channelCount + "ch");
+            }
+            MediaFormat mediaFormat = MediaFormat.createAudioFormat(mimeType, sampleRate, channelCount);
+            mediaFormat.setInteger(MediaFormat.KEY_PRIORITY, 0);
+            mediaFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 64 * 1024);
+            mediaFormat.setInteger(MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_16BIT);
+            for (int index = 0; index < format.initializationData.size(); index++) {
+                mediaFormat.setByteBuffer("csd-" + index,
+                    ByteBuffer.wrap(format.initializationData.get(index)));
+            }
+            List<String> names = audioDecoderNames(mimeType);
+            value = AudioDecoderFallback.open(names, name -> {
+                MediaCodec candidate = name == null
+                    ? MediaCodec.createDecoderByType(mimeType) : MediaCodec.createByCodecName(name);
+                boolean configured = false;
+                try {
+                    candidate.configure(mediaFormat, null, null, 0);
+                    candidate.start();
+                    configured = true;
+                    return candidate;
+                } finally {
+                    if (!configured) { stopAndReleaseAudioCodec(candidate); }
                 }
+            });
+            String codecName = value.getName();
+            synchronized (audioCodecLock) {
+                if (stopped || audioDisabled) { return; }
                 audioCodec = value;
                 value = null;
             }
-            Log.i(
-                TAG,
-                "AAC decoder started: " + codecName + " " + sampleRate + "Hz/"
-                    + channelCount + "ch"
-            );
+            Log.i(TAG, "AAC decoder started: " + codecName + " " + sampleRate + "Hz/" + channelCount + "ch");
             audioOutputThread = new Thread(this::runAudioOutput, "CarLink-Audio-Output");
             audioOutputThread.setPriority(Thread.MAX_PRIORITY);
             audioOutputThread.start();
-        } catch (IOException | IllegalArgumentException | IllegalStateException error) {
-            disableAudio("AAC decoder startup failed", error);
+        } catch (IOException | RuntimeException error) {
+            disableAudio("AAC 解码器启动失败", error);
         } finally {
-            if (value != null) {
-                stopAndReleaseCodec(value);
-            }
+            if (value != null) { stopAndReleaseAudioCodec(value); }
         }
+    }
+
+    private List<String> audioDecoderNames(String mimeType) {
+        List<String> software = new ArrayList<>();
+        List<String> others = new ArrayList<>();
+        try {
+            for (MediaCodecInfo info : new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos()) {
+                if (info.isEncoder()) { continue; }
+                for (String type : info.getSupportedTypes()) {
+                    if (mimeType.equalsIgnoreCase(type)) {
+                        (info.isSoftwareOnly() ? software : others).add(info.getName());
+                        break;
+                    }
+                }
+            }
+        } catch (RuntimeException error) {
+            Log.w(TAG, "Audio decoder inventory unavailable; trying explicit names and MIME lookup", error);
+        }
+        software.addAll(others);
+        if ("audio/mp4a-latm".equalsIgnoreCase(mimeType)) {
+            // This head unit declares these names even when createDecoderByType cannot resolve AAC.
+            software.add("c2.android.aac.decoder");
+            software.add("OMX.google.aac.decoder");
+        }
+        return software;
+    }
+
+    private static void stopAndReleaseAudioCodec(MediaCodec value) {
+        try { value.stop(); } catch (RuntimeException ignored) { }
+        try { value.release(); } catch (RuntimeException ignored) { }
     }
 
     private static void stopAndReleaseCodec(MediaCodec value) {
@@ -434,9 +475,9 @@ final class DirectTsVideoDecoder {
             input.put(data, offset, size);
             value.queueInputBuffer(inputIndex, 0, size, Math.max(0, timeUs), 0);
             queuedAudioFrames++;
-        } catch (IllegalStateException error) {
+        } catch (RuntimeException error) {
             if (!stopped) {
-                disableAudio("AAC input failed", error);
+                disableAudio("AAC 输入失败", error);
             }
         }
     }
@@ -542,9 +583,9 @@ final class DirectTsVideoDecoder {
                 } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     configureAudioPlayer(value.getOutputFormat());
                 }
-            } catch (IllegalArgumentException | IllegalStateException error) {
+            } catch (RuntimeException error) {
                 if (!stopped) {
-                    disableAudio("AAC output failed", error);
+                    disableAudio("AAC 输出失败", error);
                 }
                 return;
             }
@@ -696,51 +737,44 @@ final class DirectTsVideoDecoder {
             return true;
         }
         synchronized (audioCodecLock) {
+            if (stopped || audioDisabled) {
+                return false;
+            }
             if (audioFocusRequested) {
                 return audioFocusGranted;
             }
-        }
-        int result = audioManager.requestAudioFocus(audioFocusRequest);
-        synchronized (audioCodecLock) {
+            int result = audioManager.requestAudioFocus(audioFocusRequest);
             audioFocusRequested = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
                 || result == AudioManager.AUDIOFOCUS_REQUEST_DELAYED;
             audioFocusGranted = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+            if (!audioFocusRequested) {
+                Log.w(TAG, "Audio focus request was rejected: " + result);
+            }
+            return audioFocusGranted;
         }
-        if (!audioFocusRequested) {
-            Log.w(TAG, "Audio focus request was rejected: " + result);
-        }
-        return audioFocusGranted;
     }
 
     private void handleAudioFocusChange(int focusChange) {
-        AudioTrack player = audioPlayer;
-        if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
-            audioFocusGranted = true;
-            if (player != null && player.getState() == AudioTrack.STATE_INITIALIZED) {
-                try {
+        if (stopped || audioDisabled) { return; }
+        try {
+            AudioTrack player = audioPlayer;
+            if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
+                audioFocusGranted = true;
+                if (player != null && player.getState() == AudioTrack.STATE_INITIALIZED) {
                     player.setVolume(1f);
                     player.play();
-                } catch (IllegalStateException error) {
-                    disableAudio("Could not resume AudioTrack", error);
                 }
-            }
-            return;
-        }
-        if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
-            if (player != null) {
-                player.setVolume(0.25f);
-            }
-            return;
-        }
-        if (focusChange == AudioManager.AUDIOFOCUS_LOSS
-            || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
-            audioFocusGranted = false;
-            if (player != null && player.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
-                try {
+            } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
+                if (player != null) { player.setVolume(0.25f); }
+            } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS
+                || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+                audioFocusGranted = false;
+                if (player != null && player.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
                     player.pause();
-                } catch (IllegalStateException ignored) {
                 }
             }
+        } catch (RuntimeException error) {
+            if (!stopped) { disableAudio("音频焦点或播放状态异常", error); }
         }
     }
     private void logStats() {
@@ -787,6 +821,10 @@ final class DirectTsVideoDecoder {
             output.interrupt();
         }
         releaseAudio();
+        if (!stopped) {
+            try { listener.onError("音频不可用：" + message + "；视频与触摸继续运行"); }
+            catch (RuntimeException callbackError) { Log.w(TAG, "Audio status callback failed", callbackError); }
+        }
     }
 
     private void releaseAudio() {
@@ -804,7 +842,7 @@ final class DirectTsVideoDecoder {
         }
         releaseAudioTrack(player);
         if (codecValue != null) {
-            stopAndReleaseCodec(codecValue);
+            stopAndReleaseAudioCodec(codecValue);
         }
         if (abandonFocus && audioManager != null) {
             try {
@@ -821,17 +859,18 @@ final class DirectTsVideoDecoder {
         }
         try {
             player.pause();
-        } catch (IllegalStateException ignored) {
+        } catch (RuntimeException ignored) {
         }
         try {
             player.flush();
-        } catch (IllegalStateException ignored) {
+        } catch (RuntimeException ignored) {
         }
         try {
             player.stop();
-        } catch (IllegalStateException ignored) {
+        } catch (RuntimeException ignored) {
         }
-        player.release();
+        try { player.release(); }
+        catch (RuntimeException error) { Log.w(TAG, "AudioTrack release failed", error); }
     }
 
     private static void prioritizeAudioThread() {
@@ -907,65 +946,94 @@ final class DirectTsVideoDecoder {
     }
 
     private final class AudioTrackOutput implements TrackOutput {
+        private static final int MAX_SAMPLE_BYTES = 1024 * 1024;
         private byte[] pending = new byte[64 * 1024];
+        private final byte[] discarded = new byte[8 * 1024];
         private int pendingSize;
 
         @Override
         public void format(Format format) {
-            Log.i(
-                TAG,
-                "Audio format: mime=" + format.sampleMimeType + " sampleRate=" + format.sampleRate
-                    + " channelCount=" + format.channelCount
-            );
-            configureAudioCodec(format);
+            if (audioDisabled || stopped) { return; }
+            try {
+                Log.i(TAG, "Audio format: mime=" + format.sampleMimeType + " sampleRate=" + format.sampleRate
+                    + " channelCount=" + format.channelCount);
+                configureAudioCodec(format);
+            } catch (RuntimeException error) {
+                disableAudio("音频格式处理失败", error);
+            }
         }
 
         @Override
         public int sampleData(DataReader input, int length, boolean allowEndOfInput, int sampleDataPart)
             throws IOException {
-            ensureCapacity(pendingSize + length);
+            if (length <= 0) { return 0; }
+            if (audioDisabled || stopped) {
+                discardPending();
+                return input.read(discarded, 0, Math.min(length, discarded.length));
+            }
+            try { ensureCapacity(pendingSize + length); }
+            catch (IllegalArgumentException error) {
+                disableAudio("音频样本过大", error);
+                discardPending();
+                return input.read(discarded, 0, Math.min(length, discarded.length));
+            }
+            // An IOException from this shared TS input is a transport error and still propagates.
             int count = input.read(pending, pendingSize, length);
             if (count == C.RESULT_END_OF_INPUT && !allowEndOfInput) {
-                throw new IOException("AAC sample ended unexpectedly");
+                disableAudio("音频样本提前结束", null);
+                discardPending();
             }
-            if (count > 0) {
-                pendingSize += count;
-            }
+            if (count > 0) { pendingSize += count; }
             return count;
         }
 
         @Override
         public void sampleData(ParsableByteArray data, int length, int sampleDataPart) {
-            ensureCapacity(pendingSize + length);
-            data.readBytes(pending, pendingSize, length);
-            pendingSize += length;
+            if (audioDisabled || stopped) {
+                discardPending();
+                data.skipBytes(Math.min(Math.max(0, length), data.bytesLeft()));
+                return;
+            }
+            try {
+                ensureCapacity(pendingSize + length);
+                data.readBytes(pending, pendingSize, length);
+                pendingSize += length;
+            } catch (RuntimeException error) {
+                disableAudio("音频样本解析失败", error);
+                discardPending();
+                data.skipBytes(Math.min(Math.max(0, length), data.bytesLeft()));
+            }
         }
 
         @Override
         public void sampleMetadata(long timeUs, int flags, int size, int offset, CryptoData cryptoData) {
+            if (audioDisabled || stopped) { discardPending(); return; }
             int sampleEnd = pendingSize - offset;
             int sampleStart = sampleEnd - size;
             if (sampleStart < 0 || sampleEnd < sampleStart || sampleEnd > pendingSize) {
-                Log.w(TAG, "Invalid audio sample bounds size=" + size + " offset=" + offset);
-                pendingSize = 0;
+                disableAudio("音频样本边界无效", null);
+                discardPending();
                 return;
             }
             queueAudioSample(pending, sampleStart, size, timeUs);
+            if (audioDisabled) { discardPending(); return; }
             int retained = pendingSize - sampleEnd;
-            if (retained > 0) {
-                System.arraycopy(pending, sampleEnd, pending, 0, retained);
-            }
+            if (retained > 0) { System.arraycopy(pending, sampleEnd, pending, 0, retained); }
             pendingSize = retained;
         }
 
+        private void discardPending() {
+            Arrays.fill(pending, 0, pendingSize, (byte) 0);
+            pendingSize = 0;
+        }
+
         private void ensureCapacity(int required) {
-            if (required <= pending.length) {
-                return;
+            if (required < 0 || required > MAX_SAMPLE_BYTES) {
+                throw new IllegalArgumentException("AAC 样本超过容量限制");
             }
+            if (required <= pending.length) { return; }
             int capacity = pending.length;
-            while (capacity < required) {
-                capacity *= 2;
-            }
+            while (capacity < required) { capacity *= 2; }
             pending = Arrays.copyOf(pending, capacity);
         }
     }

@@ -37,22 +37,16 @@ final class IccoaProtocol {
     }
 
     static Identity loadIdentity(Context context) {
-        String encoded = context.getSharedPreferences("carlink", Context.MODE_PRIVATE)
-            .getString("car_id", "");
-        byte[] carId;
-        try {
-            carId = fromHex(encoded);
-        } catch (IllegalArgumentException error) {
-            carId = new byte[0];
-        }
-        if (carId.length != 6) {
-            carId = new byte[6];
-            RANDOM.nextBytes(carId);
-            context.getSharedPreferences("carlink", Context.MODE_PRIVATE)
-                .edit()
-                .putString("car_id", toHex(carId))
-                .apply();
-        }
+        context.getSharedPreferences("carlink", Context.MODE_PRIVATE)
+            .edit()
+            .remove("car_id")
+            .commit();
+        return createIdentity();
+    }
+
+    static Identity createIdentity() {
+        byte[] carId = new byte[6];
+        RANDOM.nextBytes(carId);
         return new Identity(carId, new byte[4], new byte[2]);
     }
 
@@ -130,22 +124,6 @@ final class IccoaProtocol {
             result.append(String.format(Locale.US, "%02x", item & 0xff));
         }
         return result.toString();
-    }
-
-    private static byte[] fromHex(String value) {
-        if ((value.length() & 1) != 0) {
-            throw new IllegalArgumentException("odd hex length");
-        }
-        byte[] result = new byte[value.length() / 2];
-        for (int index = 0; index < result.length; index++) {
-            int high = Character.digit(value.charAt(index * 2), 16);
-            int low = Character.digit(value.charAt(index * 2 + 1), 16);
-            if (high < 0 || low < 0) {
-                throw new IllegalArgumentException("invalid hex");
-            }
-            result[index] = (byte) ((high << 4) | low);
-        }
-        return result;
     }
 
     private IccoaProtocol() {
